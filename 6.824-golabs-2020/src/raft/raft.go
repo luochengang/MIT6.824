@@ -46,8 +46,8 @@ type ApplyMsg struct {
 }
 
 type Log struct {
-	command interface{} // command for state machine
-	term    int         // term when entry was received by leader (first index is 1)
+	Command interface{} // command for state machine
+	Term    int         // term when entry was received by leader (first index is 1)
 }
 
 type Role int
@@ -207,15 +207,38 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 更新自己的当前任期
+	if rf.currentTerm < args.Term && rf.role != Follower {
+		rf.role = Follower
+	}
+	rf.currentTerm = max(rf.currentTerm, args.Term)
+	reply.Term = rf.currentTerm
+
+	// 根据日志新的程度决定是否投票
 	if args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
 		args.LastLogIndex >= len(rf.log)) {
-		rf.currentTerm = max(rf.currentTerm, args.Term)
 		reply.VoteGranted = true
+	} else {
+		reply.VoteGranted = false
 	}
+
+	// 刷新选举超时时间
+	randTime := ElectTimeoutMin + rand.Intn(ElectTimeoutMax-ElectTimeoutMin)
+	now := time.Now()
+	rf.electTimeout = now.Add(time.Duration(randTime) * time.Millisecond)
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	rf.currentTerm = max(rf.currentTerm, args.Term)
+
+	reply.Term = rf.currentTerm
+	reply.Success = true
 }
 
 //
@@ -307,7 +330,7 @@ func getLastLogTerm(log []Log) int {
 	if len(log) == 0 {
 		return 0
 	}
-	return log[len(log)-1].term
+	return log[len(log)-1].Term
 }
 
 func (rf *Raft) becomeLeader() {
@@ -320,9 +343,13 @@ func (rf *Raft) becomeLeader() {
 				return
 			}
 
-			time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
-			if rf.role != Leader {
-				return
+			for rf.role == Leader {
+				time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
+
+				args := &AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me}
+				reply := &AppendEntriesReply{}
+				// 这里失败了需要重发吗
+				rf.sendAppendEntries(server, args, reply)
 			}
 		}(i)
 	}
@@ -347,13 +374,20 @@ func (rf *Raft) startElection() {
 	for i := range rf.peers {
 		go func(server int) {
 			defer wg.Done()
+			rf.mu.Lock()
 
 			// 不用给自己发
 			if server == rf.me {
+				rf.mu.Unlock()
 				return
 			}
 
-			rf.mu.Lock()
+			// 如果已经是Follower, 那么不再发送RequestVote RPC
+			if rf.role != Candidate {
+				rf.mu.Unlock()
+				return
+			}
+
 			args := &RequestVoteArgs{Term: rf.currentTerm,
 				CandidateId:  rf.me,
 				LastLogIndex: len(rf.log),
@@ -361,8 +395,20 @@ func (rf *Raft) startElection() {
 			rf.mu.Unlock()
 
 			reply := &RequestVoteReply{}
+			/*
+				这里如果没收到响应, 需要一直发吗; 如果一直发, 可能导致这个goroutine一直无法结束, 从而无法统计投票结果
+				所以不一直发
+			*/
 			received := rf.sendRequestVote(server, args, reply)
-			if received {
+			if !received {
+				return
+			}
+
+			// 如果RPC响应的任期号比自己更新, 那么变成Follower
+			if reply.Term > rf.currentTerm {
+				rf.role = Follower
+			}
+			if reply.VoteGranted {
 				countVote++
 			}
 		}(i)
@@ -380,7 +426,7 @@ func (rf *Raft) checkElectLoop() {
 		rf.mu.Lock()
 		timeout := rf.electTimeout
 		rf.mu.Unlock()
-		if time.Now().After(timeout) {
+		if rf.role == Follower && time.Now().After(timeout) {
 			rf.startElection()
 		}
 	}
