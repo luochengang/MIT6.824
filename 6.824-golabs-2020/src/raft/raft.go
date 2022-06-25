@@ -84,8 +84,8 @@ type Raft struct {
 	currentTerm int // latest term server has seen. initialized to 0 on first boot
 	votedFor    int // candidateId that received vote in current term (or null if none)
 	/*
-		log entries; each entry contains command for state machine, and term when entry was received
-		by leader (first index is 1)
+	   log entries; each entry contains command for state machine, and term when entry was received
+	   by leader (first index is 1)
 	*/
 	log []Log
 
@@ -95,8 +95,8 @@ type Raft struct {
 
 	// Volatile state on leaders(Reinitialized after election)
 	/*
-		for each server, index of the next log entry to send to that server (initialized
-		to leader last log index + 1)
+	   for each server, index of the next log entry to send to that server (initialized
+	   to leader last log index + 1)
 	*/
 	nextIndex  []int
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server, initialized to 0
@@ -118,6 +118,14 @@ func (rf *Raft) GetState() (int, bool) {
 	isleader = rf.role == Leader
 
 	return term, isleader
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
 }
 
 //
@@ -199,6 +207,11 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	if args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
+		args.LastLogIndex >= len(rf.log)) {
+		rf.currentTerm = max(rf.currentTerm, args.Term)
+		reply.VoteGranted = true
+	}
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
