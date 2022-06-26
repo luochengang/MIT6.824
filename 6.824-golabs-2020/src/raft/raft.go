@@ -210,20 +210,30 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 更新自己的当前任期
-	if rf.currentTerm < args.Term && rf.role != Follower {
-		rf.role = Follower
-	}
-	rf.currentTerm = max(rf.currentTerm, args.Term)
-	reply.Term = rf.currentTerm
-
-	// 根据日志新的程度决定是否投票
-	if args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
-		args.LastLogIndex >= len(rf.log)) {
+	if rf.currentTerm < args.Term {
+		if rf.role != Follower {
+			rf.role = Follower
+		}
 		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
 	} else {
 		reply.VoteGranted = false
 	}
+
+	/*
+		// 根据日志新的程度决定是否投票
+		if args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
+			args.LastLogIndex >= len(rf.log)) {
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+		} else {
+			reply.VoteGranted = false
+		}
+	*/
+
+	// 更新自己的当前任期
+	rf.currentTerm = max(rf.currentTerm, args.Term)
+	reply.Term = rf.currentTerm
 
 	// 刷新选举超时时间
 	randTime := ElectTimeoutMin + rand.Intn(ElectTimeoutMax-ElectTimeoutMin)
@@ -235,10 +245,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.currentTerm = max(rf.currentTerm, args.Term)
+	if args.Term < rf.currentTerm {
+		// Follower任期 > Leader任期
+		reply.Success = false
+	} else {
+		// Candidate状态下收到了心跳
+		if rf.role == Candidate {
+			rf.role = Follower
+		}
+
+		if args.Term > rf.currentTerm {
+			rf.currentTerm = args.Term
+		}
+
+		// 刷新选举超时时间
+		randTime := ElectTimeoutMin + rand.Intn(ElectTimeoutMax-ElectTimeoutMin)
+		now := time.Now()
+		rf.electTimeout = now.Add(time.Duration(randTime) * time.Millisecond)
+		reply.Success = true
+	}
 
 	reply.Term = rf.currentTerm
-	reply.Success = true
 }
 
 //
@@ -326,6 +353,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// 调用时必须持有锁
 func getLastLogTerm(log []Log) int {
 	if len(log) == 0 {
 		return 0
@@ -334,7 +362,9 @@ func getLastLogTerm(log []Log) int {
 }
 
 func (rf *Raft) becomeLeader() {
+	rf.mu.Lock()
 	rf.role = Leader
+	rf.mu.Unlock()
 
 	for i := range rf.peers {
 		go func(server int) {
@@ -346,10 +376,18 @@ func (rf *Raft) becomeLeader() {
 			for rf.role == Leader {
 				time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
 
+				rf.mu.Lock()
 				args := &AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me}
+				rf.mu.Unlock()
 				reply := &AppendEntriesReply{}
 				// 这里失败了需要重发吗
 				rf.sendAppendEntries(server, args, reply)
+
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					rf.role = Follower
+				}
+				rf.mu.Unlock()
 			}
 		}(i)
 	}
@@ -415,7 +453,7 @@ func (rf *Raft) startElection() {
 	}
 	wg.Wait()
 
-	if countVote >= (serverNum-1)/2+1 {
+	if rf.role == Candidate && countVote >= (serverNum-1)/2+1 {
 		rf.becomeLeader()
 	}
 }
