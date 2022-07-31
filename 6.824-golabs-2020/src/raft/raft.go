@@ -61,9 +61,9 @@ const (
 
 // ms
 const (
-	CheckElectTimeout = 30
-	ElectTimeoutMin   = 300
-	ElectTimeoutMax   = 450
+	CheckElectTimeout = 10
+	ElectTimeoutMin   = 210
+	ElectTimeoutMax   = 710
 	HeartbeatTimeout  = 100
 )
 
@@ -211,50 +211,39 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	// 这里的if 可能可以优化
-	if rf.currentTerm < args.Term {
-		// 根据日志新的程度决定是否投票
-		if args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
-			args.LastLogIndex >= len(rf.log)) {
-			if rf.role != Follower {
-				rf.role = Follower
-			}
-			reply.VoteGranted = true
-			rf.votedFor = args.CandidateId
-		} else {
-			reply.VoteGranted = false
-		}
-	} else {
-		reply.VoteGranted = false
-	}
-
-	// 更新自己的当前任期
-	rf.currentTerm = max(rf.currentTerm, args.Term)
 	reply.Term = rf.currentTerm
 
-	// 刷新选举超时时间
-	randTime := ElectTimeoutMin + rand.Intn(ElectTimeoutMax-ElectTimeoutMin)
-	now := time.Now()
-	rf.electTimeout = now.Add(time.Duration(randTime) * time.Millisecond)
+	if rf.currentTerm > args.Term {
+		return
+	}
+	/*
+		根据日志新的程度决定是否投票
+		这里的rf.votedFor == args.CandidateId是考虑RPC响应可能丢失的情况
+	*/
+	if (rf.currentTerm < args.Term || rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
+		(args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
+			args.LastLogIndex >= len(rf.log))) {
+		if rf.role == Leader {
+			fmt.Printf("####Server%d任期%d变为Follower\n", rf.me, rf.currentTerm)
+		}
+		rf.currentTerm = args.Term
+		rf.role = Follower
+		rf.votedFor = args.CandidateId
+		rf.resetTimeout()
+		reply.VoteGranted = true
+	}
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		// Leader任期 < Follower任期
 		reply.Success = false
 	} else {
-		// Candidate状态下收到了心跳
-		if rf.role == Candidate {
-			rf.role = Follower
-			rf.votedFor = -1
-		}
-		if args.Term > rf.currentTerm {
-			rf.currentTerm = args.Term
-		}
+		rf.convertToFollower(args.Term)
 
 		if args.PrevLogIndex == 0 {
 			reply.Success = true
@@ -279,14 +268,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = args.LeaderCommit
 		}
-
-		// 刷新选举超时时间
-		randTime := ElectTimeoutMin + rand.Intn(ElectTimeoutMax-ElectTimeoutMin)
-		now := time.Now()
-		rf.electTimeout = now.Add(time.Duration(randTime) * time.Millisecond)
 	}
-
-	reply.Term = rf.currentTerm
 }
 
 //
@@ -419,8 +401,7 @@ func (rf *Raft) appendLog(server int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
-		rf.role = Follower
-		rf.votedFor = -1
+		rf.convertToFollower(reply.Term)
 		return
 	}
 	// 这里不需要统计是否半数以上服务器返回了成功
@@ -474,7 +455,7 @@ func (rf *Raft) becomeLeader() {
 			continue
 		}
 		go func(server int) {
-			for rf.role == Leader {
+			for !rf.killed() && rf.role == Leader {
 				time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
 
 				rf.appendLog(server)
@@ -504,7 +485,7 @@ func (rf *Raft) updateLeaderCommitIndex() {
 		}
 
 		// 只有当前任期的log用统计是否过半来决定是否commit, 之前任期的log被动commit
-		if replicaCnt >= (len(rf.peers)-1)/2+1 && rf.log[maxCommitIdx-1].Term == rf.currentTerm {
+		if replicaCnt > len(rf.peers)/2 && rf.log[maxCommitIdx-1].Term == rf.currentTerm {
 			rf.commitIndex = maxCommitIdx
 			return
 		}
@@ -518,33 +499,25 @@ func (rf *Raft) updateLeaderCommitIndex() {
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.currentTerm++
+	// 刚开始选举时的任期
+	term := rf.currentTerm
 	rf.role = Candidate
 	rf.votedFor = rf.me
-	serverNum := len(rf.peers)
-
-	randTime := ElectTimeoutMin + rand.Intn(ElectTimeoutMax-ElectTimeoutMin)
-	now := time.Now()
-	rf.electTimeout = now.Add(time.Duration(randTime) * time.Millisecond)
+	rf.resetTimeout()
 	rf.mu.Unlock()
 
 	countVote := 1
-	var wg sync.WaitGroup
+	done := false
 
-	wg.Add(serverNum)
 	for i := range rf.peers {
+		// 不用给自己发
+		if i == rf.me {
+			return
+		}
 		go func(server int) {
-			defer wg.Done()
 			rf.mu.Lock()
-			role := rf.role
-
-			// 不用给自己发
-			if server == rf.me {
-				rf.mu.Unlock()
-				return
-			}
-
 			// 如果已经是Follower, 那么不再发送RequestVote RPC
-			if role != Candidate {
+			if rf.role != Candidate {
 				rf.mu.Unlock()
 				return
 			}
@@ -566,28 +539,29 @@ func (rf *Raft) startElection() {
 			}
 
 			rf.mu.Lock()
-			defer rf.mu.Unlock()
 			// 如果RPC响应的任期号比自己更新, 那么变成Follower
 			if reply.Term > rf.currentTerm {
-				rf.role = Follower
-				rf.votedFor = -1
+				rf.convertToFollower(reply.Term)
 			}
 			if reply.VoteGranted {
 				fmt.Printf("####Server%d任期%d投票给Candidate%d任期%d\n", server, reply.Term, rf.me, rf.currentTerm)
 				countVote++
 			}
+
+			if done || countVote <= len(rf.peers)/2 {
+				rf.mu.Unlock()
+				return
+			}
+			done = true
+			if rf.currentTerm == term && rf.role == Candidate && countVote > len(rf.peers)/2 {
+				// 服务器还是选举刚开始时的任期, 还是Candidate, 获得了过半的投票, 变成Leader
+				fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
+				rf.mu.Unlock()
+				rf.becomeLeader()
+			} else {
+				rf.mu.Unlock()
+			}
 		}(i)
-	}
-	wg.Wait()
-
-	rf.mu.Lock()
-	role := rf.role
-	rf.mu.Unlock()
-
-	if role == Candidate && countVote >= (serverNum-1)/2+1 {
-		// 服务器还是Candidate并且获得了过半的投票, 变成Leader
-		fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
-		rf.becomeLeader()
 	}
 }
 
@@ -595,16 +569,44 @@ func (rf *Raft) startElection() {
  * @Description: 服务器周期性检查是否选举超时
  */
 func (rf *Raft) checkElectLoop() {
-	for {
-		// 每30ms检查一次 这里可以优化吗? 用条件变量?
+	for !rf.killed() {
+		// 每10ms检查一次 这里可以优化吗? 用条件变量?
 		time.Sleep(time.Duration(CheckElectTimeout) * time.Millisecond)
 		rf.mu.Lock()
-		timeout := rf.electTimeout
-		rf.mu.Unlock()
-		if rf.role == Follower && time.Now().After(timeout) {
-			rf.startElection()
+		if rf.role != Leader && rf.expired() {
+			go rf.startElection()
 		}
+		rf.mu.Unlock()
 	}
+}
+
+/**
+ * @Description: 调用时必须持有锁
+ */
+func (rf *Raft) resetTimeout() {
+	randTime := ElectTimeoutMin + rand.Intn(ElectTimeoutMax-ElectTimeoutMin)
+	now := time.Now()
+	rf.electTimeout = now.Add(time.Duration(randTime) * time.Millisecond)
+}
+
+/**
+ * @Description: 检查选举定时器是否超时, 调用时必须持有锁
+ * @return bool
+ */
+func (rf *Raft) expired() bool {
+	return time.Now().After(rf.electTimeout)
+}
+
+/**
+ * @Description: 调用时必须持有锁
+ * @param newTerm 新的任期
+ */
+func (rf *Raft) convertToFollower(newTerm int) {
+	// 每次状态变为Follower都要把投票改成-1
+	rf.currentTerm = newTerm
+	rf.role = Follower
+	rf.votedFor = -1
+	rf.resetTimeout()
 }
 
 //
@@ -626,12 +628,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	// 每次状态变为Follower都要把投票改成-1
-	rf.role = Follower
-	rf.votedFor = -1
-	randTime := ElectTimeoutMin + rand.Intn(ElectTimeoutMax-ElectTimeoutMin)
-	now := time.Now()
-	rf.electTimeout = now.Add(time.Duration(randTime) * time.Millisecond)
+	rf.convertToFollower(0)
 	rf.cond = sync.NewCond(&rf.mu)
 
 	go rf.checkElectLoop()
