@@ -105,6 +105,7 @@ type Raft struct {
 	role         Role       // current role
 	electTimeout time.Time  // 选举超时时间
 	cond         *sync.Cond // Leader收到新Log时将激活该条件变量
+	applyCh      chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -127,6 +128,14 @@ func max(a, b int) int {
 		return a
 	} else {
 		return b
+	}
+}
+
+func min(a, b int) int {
+	if a > b {
+		return b
+	} else {
+		return a
 	}
 }
 
@@ -217,6 +226,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if rf.currentTerm < args.Term {
+		if rf.role == Leader {
+			fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, args.Term)
+		}
 		rf.convertToFollower(args.Term, -1)
 	}
 
@@ -227,9 +239,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		(args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
 			args.LastLogIndex >= len(rf.log))) {
-		if rf.role == Leader {
-			fmt.Printf("####Server%d任期%d变为Follower\n", rf.me, rf.currentTerm)
-		}
+		fmt.Printf("####Server%d最后日志任期%d给Candidate%d最后日志任期%d投票\n", rf.me,
+			getLastLogTerm(rf.log), args.CandidateId, args.LastLogTerm)
+		fmt.Printf("####此时Server%d的日志为%+v\n", rf.me,
+			rf.log)
 		rf.convertToFollower(args.Term, args.CandidateId)
 		reply.VoteGranted = true
 	}
@@ -240,11 +253,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 
+	if rf.role == Leader {
+		fmt.Printf("####出现了两个Leader#Leader%d任期%d#Leader%d任期%d\n", rf.me, rf.currentTerm, args.LeaderId,
+			args.Term)
+	}
 	// Leader任期 < Follower任期
 	if args.Term < rf.currentTerm {
 		return
 	}
 	rf.convertToFollower(args.Term, args.LeaderId)
+	//fmt.Printf("####Server%d任期%d收到的日志长度为%d\n", rf.me, rf.currentTerm, len(args.Entries))
+	fmt.Printf("####Server%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 
 	if args.PrevLogIndex == 0 {
 		reply.Success = true
@@ -257,17 +276,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 	} else if rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm {
 		reply.Success = true
+		if len(args.Entries) > 0 {
+			fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
+		}
 		// 复制log到Follower
 		rf.log = rf.log[:args.PrevLogIndex]
 		for _, v := range args.Entries {
 			rf.log = append(rf.log, v)
 		}
+		if len(args.Entries) > 0 {
+			fmt.Printf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
+			fmt.Printf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
+		}
 	} else {
 		reply.Success = false
 	}
 
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = args.LeaderCommit
+	// 服务器只在日志和Leader匹配的情况下更新commitIndex
+	if reply.Success {
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log))
+			fmt.Printf("####Server%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, rf.commitIndex)
+			// 这里已经用rf.mu.Lock()加锁了, 不需要再用rf.cond.L.Lock()加锁, 否则会导致死锁
+			rf.cond.Signal()
+		}
 	}
 }
 
@@ -332,16 +364,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if rf.role != Leader {
+		rf.mu.Unlock()
 		return index, term, false
 	}
 
 	rf.log = append(rf.log, Log{Command: command, Term: rf.currentTerm})
 	index = len(rf.log)
 	term = rf.currentTerm
-	rf.cond.Signal()
+	rf.matchIndex[rf.me] = len(rf.log)
+	rf.nextIndex[rf.me] = len(rf.log) + 1
+	rf.mu.Unlock()
 
+	rf.appendLog()
 	return index, term, isLeader
 }
 
@@ -374,48 +409,81 @@ func getLastLogTerm(log []Log) int {
 	return log[len(log)-1].Term
 }
 
-func (rf *Raft) appendLog(server int) {
+/**
+ * @Description: Leader给其他服务器发送心跳消息
+ */
+func (rf *Raft) appendLog() {
 	rf.mu.Lock()
-
-	prevLogIndex := rf.nextIndex[server] - 1
-	var prevLogTerm int
-	if prevLogIndex >= 1 {
-		prevLogTerm = rf.log[prevLogIndex-1].Term
-	}
-	entries := make([]Log, len(rf.log)-rf.nextIndex[server]+1)
-	for j := range entries {
-		entries[j] = rf.log[rf.nextIndex[server]-1+j]
-	}
-
-	args := &AppendEntriesArgs{Term: rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
-		Entries:      entries,
-		LeaderCommit: rf.commitIndex}
+	fmt.Printf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 	rf.mu.Unlock()
-	reply := &AppendEntriesReply{}
-	// 这里失败了不需要重发
-	ok := rf.sendAppendEntries(server, args, reply)
-	if !ok {
-		return
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if reply.Term > rf.currentTerm {
-		rf.convertToFollower(reply.Term, -1)
-		return
-	}
-	// 这里不需要统计是否半数以上服务器返回了成功
-	if reply.Success {
-		rf.nextIndex[server] = args.PrevLogIndex + len(entries) + 1
-		rf.matchIndex[server] = rf.nextIndex[server] - 1
-	} else {
-		if rf.nextIndex[server] > 1 {
-			rf.nextIndex[server]--
+	for i := range rf.peers {
+		// 不用给自己发心跳
+		if i == rf.me {
+			continue
 		}
+		go func(server int) {
+			rf.mu.Lock()
+			// !!!这里再次获取锁以后, 可能已经不是leader了
+			if rf.role != Leader {
+				rf.mu.Unlock()
+				return
+			}
+
+			prevLogIndex := rf.nextIndex[server] - 1
+			var prevLogTerm int
+			if prevLogIndex >= 1 {
+				prevLogTerm = rf.log[prevLogIndex-1].Term
+			}
+			entries := make([]Log, len(rf.log)-rf.nextIndex[server]+1)
+			for j := range entries {
+				entries[j] = rf.log[rf.nextIndex[server]-1+j]
+			}
+
+			args := &AppendEntriesArgs{Term: rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: rf.commitIndex}
+			nextIdx := rf.nextIndex[server]
+			rf.mu.Unlock()
+			reply := &AppendEntriesReply{}
+			//fmt.Printf("####Leader%d任期%d发出的日志长度为%d\n", rf.me, rf.currentTerm, len(args.Entries))
+			//fmt.Printf("####Leader%d任期%d#%d#%d\n", rf.me, rf.currentTerm, len(rf.log), rf.nextIndex[server])
+			// 这里失败了不需要重发
+			ok := rf.sendAppendEntries(server, args, reply)
+			if !ok {
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			// 这里再次获取锁以后, 可能已经不是leader了
+			if rf.role != Leader {
+				return
+			}
+			if reply.Term > rf.currentTerm {
+				fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, reply.Term)
+				rf.convertToFollower(reply.Term, -1)
+				return
+			}
+
+			// 这里的rf.nextIndex[server]可能和发送RPC之前的rf.nextIndex[server]不一样了
+			if rf.nextIndex[server] != nextIdx {
+				return
+			}
+			// 这里不需要统计是否半数以上服务器返回了成功
+			if reply.Success {
+				rf.nextIndex[server] += len(entries)
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+			} else {
+				if rf.nextIndex[server] > 1 {
+					rf.nextIndex[server]--
+				}
+			}
+		}(i)
 	}
+	rf.updateLeaderCommitIndex()
 }
 
 func (rf *Raft) becomeLeader() {
@@ -428,6 +496,7 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex = append(rf.nextIndex, len(rf.log)+1)
 		rf.matchIndex = append(rf.matchIndex, 0)
 	}
+	rf.matchIndex[rf.me] = len(rf.log)
 	rf.mu.Unlock()
 
 	for !rf.killed() {
@@ -438,22 +507,13 @@ func (rf *Raft) becomeLeader() {
 		}
 		rf.mu.Unlock()
 
-		for i := range rf.peers {
-			// 不用给自己发心跳
-			if i == rf.me {
-				continue
-			}
-			go func(server int) {
-				rf.appendLog(server)
-				rf.updateLeaderCommitIndex()
-			}(i)
-		}
+		rf.appendLog()
 		time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
 	}
 }
 
 /**
- * @Description: 调用方必须是Leader
+ * @Description:
  */
 func (rf *Raft) updateLeaderCommitIndex() {
 	rf.mu.Lock()
@@ -462,6 +522,11 @@ func (rf *Raft) updateLeaderCommitIndex() {
 	if rf.role != Leader {
 		return
 	}
+	for idx, v := range rf.matchIndex {
+		fmt.Printf("####Server%d任期%d的matchIndex是%d\n", idx, rf.currentTerm, v)
+		//fmt.Printf("####Server%d任期%d的nextIndex是%d\n", idx, rf.currentTerm, rf.nextIndex[idx])
+	}
+
 	maxCommitIdx := len(rf.log)
 	for maxCommitIdx > 0 {
 		replicaCnt := 0
@@ -472,8 +537,11 @@ func (rf *Raft) updateLeaderCommitIndex() {
 		}
 
 		// 只有当前任期的log用统计是否过半来决定是否commit, 之前任期的log被动commit
-		if replicaCnt > len(rf.peers)/2 && rf.log[maxCommitIdx-1].Term == rf.currentTerm {
+		if replicaCnt > len(rf.peers)/2 && rf.log[maxCommitIdx-1].Term == rf.currentTerm &&
+			maxCommitIdx > rf.commitIndex {
+			fmt.Printf("####Leader%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, maxCommitIdx)
 			rf.commitIndex = maxCommitIdx
+			rf.cond.Signal()
 			return
 		}
 		maxCommitIdx--
@@ -491,18 +559,32 @@ func (rf *Raft) startElection() {
 	rf.role = Candidate
 	rf.votedFor = rf.me
 	rf.resetTimeout()
-	rf.mu.Unlock()
 
 	countVote := 1
 	done := false
+	// 如果只有1台服务器
+	if len(rf.peers) == 1 {
+		// 服务器还是选举刚开始时的任期, 还是Candidate, 获得了过半的投票, 变成Leader
+		fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
+		rf.mu.Unlock()
+		go rf.becomeLeader()
+		return
+	}
+	rf.mu.Unlock()
 
 	for i := range rf.peers {
 		// 不用给自己发
 		if i == rf.me {
-			return
+			continue
 		}
 		go func(server int) {
 			rf.mu.Lock()
+			// 如果这里已经不是Candidate了, 那么释放锁后直接返回, 因为只有Candidate才需要发送RequestVote RPC
+			if rf.role != Candidate {
+				rf.mu.Unlock()
+				return
+			}
+
 			args := &RequestVoteArgs{Term: rf.currentTerm,
 				CandidateId:  rf.me,
 				LastLogIndex: len(rf.log),
@@ -519,6 +601,11 @@ func (rf *Raft) startElection() {
 			}
 
 			rf.mu.Lock()
+			// 如果这里已经不是Candidate了, 那么释放锁后直接返回, 因为只有Candidate才需要发送RequestVote RPC
+			if rf.role != Candidate {
+				rf.mu.Unlock()
+				return
+			}
 			// 如果RPC响应的任期号比自己更新, 那么变成Follower
 			if reply.Term > rf.currentTerm {
 				rf.convertToFollower(reply.Term, -1)
@@ -533,7 +620,7 @@ func (rf *Raft) startElection() {
 				return
 			}
 			done = true
-			if rf.currentTerm == term && rf.role == Candidate {
+			if rf.currentTerm == term {
 				// 服务器还是选举刚开始时的任期, 还是Candidate, 获得了过半的投票, 变成Leader
 				fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
 				rf.mu.Unlock()
@@ -550,13 +637,13 @@ func (rf *Raft) startElection() {
  */
 func (rf *Raft) checkElectLoop() {
 	for !rf.killed() {
-		// 每10ms检查一次 这里可以优化吗? 用条件变量?
-		time.Sleep(time.Duration(CheckElectTimeout) * time.Millisecond)
 		rf.mu.Lock()
 		if rf.role != Leader && rf.expired() {
 			go rf.startElection()
 		}
 		rf.mu.Unlock()
+		// 每10ms检查一次 这里可以优化吗? 用条件变量?
+		time.Sleep(time.Duration(CheckElectTimeout) * time.Millisecond)
 	}
 }
 
@@ -589,6 +676,36 @@ func (rf *Raft) convertToFollower(newTerm, newVotedFor int) {
 	rf.resetTimeout()
 }
 
+/**
+ * @Description: 服务器应用已经提交的日志
+ */
+func (rf *Raft) applyCommittedEntries() {
+	for !rf.killed() {
+		// 这个方法里加锁的方式可以优化吗
+		rf.mu.Lock()
+		for rf.commitIndex <= rf.lastApplied {
+			rf.cond.Wait()
+		}
+
+		cnt := rf.commitIndex - rf.lastApplied
+		//fmt.Printf("####Server%d任期%d需要提交新日志\n", rf.me, rf.currentTerm)
+		rf.mu.Unlock()
+		for i := 0; i < cnt; i++ {
+			rf.mu.Lock()
+			applyMsg := ApplyMsg{CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Command,
+				CommandIndex: rf.lastApplied + 1}
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
+			rf.mu.Lock()
+			//fmt.Printf("####Server%d任期%d提交了新的日志%+v\n", rf.me, rf.currentTerm, applyMsg)
+			rf.lastApplied++
+			rf.mu.Unlock()
+		}
+
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -610,8 +727,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.convertToFollower(0, -1)
 	rf.cond = sync.NewCond(&rf.mu)
+	rf.applyCh = applyCh
 
 	go rf.checkElectLoop()
+	// 应用已经提交的日志
+	go rf.applyCommittedEntries()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
