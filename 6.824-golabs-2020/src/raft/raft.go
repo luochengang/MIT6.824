@@ -216,20 +216,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.currentTerm > args.Term {
 		return
 	}
+	if rf.currentTerm < args.Term {
+		rf.convertToFollower(args.Term, -1)
+	}
+
 	/*
 		根据日志新的程度决定是否投票
 		这里的rf.votedFor == args.CandidateId是考虑RPC响应可能丢失的情况
 	*/
-	if (rf.currentTerm < args.Term || rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		(args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
 			args.LastLogIndex >= len(rf.log))) {
 		if rf.role == Leader {
 			fmt.Printf("####Server%d任期%d变为Follower\n", rf.me, rf.currentTerm)
 		}
-		rf.currentTerm = args.Term
-		rf.role = Follower
-		rf.votedFor = args.CandidateId
-		rf.resetTimeout()
+		rf.convertToFollower(args.Term, args.CandidateId)
 		reply.VoteGranted = true
 	}
 }
@@ -237,37 +238,36 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	reply.Term = rf.currentTerm
+
+	// Leader任期 < Follower任期
 	if args.Term < rf.currentTerm {
-		// Leader任期 < Follower任期
+		return
+	}
+	rf.convertToFollower(args.Term, args.LeaderId)
+
+	if args.PrevLogIndex == 0 {
+		reply.Success = true
+		// 复制log到Follower
+		rf.log = nil
+		for _, v := range args.Entries {
+			rf.log = append(rf.log, v)
+		}
+	} else if args.PrevLogIndex > len(rf.log) {
 		reply.Success = false
+	} else if rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm {
+		reply.Success = true
+		// 复制log到Follower
+		rf.log = rf.log[:args.PrevLogIndex]
+		for _, v := range args.Entries {
+			rf.log = append(rf.log, v)
+		}
 	} else {
-		rf.convertToFollower(args.Term)
+		reply.Success = false
+	}
 
-		if args.PrevLogIndex == 0 {
-			reply.Success = true
-			// 复制log到Follower
-			rf.log = nil
-			for _, v := range args.Entries {
-				rf.log = append(rf.log, v)
-			}
-		} else if args.PrevLogIndex > len(rf.log) {
-			reply.Success = false
-		} else if rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm {
-			reply.Success = true
-			// 复制log到Follower
-			rf.log = rf.log[:args.PrevLogIndex]
-			for _, v := range args.Entries {
-				rf.log = append(rf.log, v)
-			}
-		} else {
-			reply.Success = false
-		}
-
-		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = args.LeaderCommit
-		}
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = args.LeaderCommit
 	}
 }
 
@@ -395,13 +395,16 @@ func (rf *Raft) appendLog(server int) {
 		LeaderCommit: rf.commitIndex}
 	rf.mu.Unlock()
 	reply := &AppendEntriesReply{}
-	// 这里失败了需要重发吗
-	rf.sendAppendEntries(server, args, reply)
+	// 这里失败了不需要重发
+	ok := rf.sendAppendEntries(server, args, reply)
+	if !ok {
+		return
+	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
-		rf.convertToFollower(reply.Term)
+		rf.convertToFollower(reply.Term, -1)
 		return
 	}
 	// 这里不需要统计是否半数以上服务器返回了成功
@@ -412,26 +415,6 @@ func (rf *Raft) appendLog(server int) {
 		if rf.nextIndex[server] > 1 {
 			rf.nextIndex[server]--
 		}
-	}
-}
-
-func (rf *Raft) appendLogByLeader() {
-	if rf.role != Leader {
-		return
-	}
-	rf.mu.Lock()
-	rf.cond.Wait()
-	rf.mu.Unlock()
-	if rf.role != Leader {
-		return
-	}
-
-	for i := range rf.peers {
-		// 不用给自己复制log
-		if i == rf.me {
-			continue
-		}
-		go rf.appendLog(i)
 	}
 }
 
@@ -447,21 +430,25 @@ func (rf *Raft) becomeLeader() {
 	}
 	rf.mu.Unlock()
 
-	go rf.appendLogByLeader()
-
-	for i := range rf.peers {
-		// 不用给自己发心跳
-		if i == rf.me {
-			continue
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.role != Leader {
+			rf.mu.Unlock()
+			return
 		}
-		go func(server int) {
-			for !rf.killed() && rf.role == Leader {
-				time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
+		rf.mu.Unlock()
 
+		for i := range rf.peers {
+			// 不用给自己发心跳
+			if i == rf.me {
+				continue
+			}
+			go func(server int) {
 				rf.appendLog(server)
 				rf.updateLeaderCommitIndex()
-			}
-		}(i)
+			}(i)
+		}
+		time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
 	}
 }
 
@@ -516,12 +503,6 @@ func (rf *Raft) startElection() {
 		}
 		go func(server int) {
 			rf.mu.Lock()
-			// 如果已经是Follower, 那么不再发送RequestVote RPC
-			if rf.role != Candidate {
-				rf.mu.Unlock()
-				return
-			}
-
 			args := &RequestVoteArgs{Term: rf.currentTerm,
 				CandidateId:  rf.me,
 				LastLogIndex: len(rf.log),
@@ -530,8 +511,7 @@ func (rf *Raft) startElection() {
 
 			reply := &RequestVoteReply{}
 			/*
-				这里如果没收到响应, 需要一直发吗; 如果一直发, 可能导致这个goroutine一直无法结束, 从而无法统计投票结果
-				所以不一直发
+				这里如果没收到响应, 不需要一直发
 			*/
 			received := rf.sendRequestVote(server, args, reply)
 			if !received {
@@ -541,7 +521,7 @@ func (rf *Raft) startElection() {
 			rf.mu.Lock()
 			// 如果RPC响应的任期号比自己更新, 那么变成Follower
 			if reply.Term > rf.currentTerm {
-				rf.convertToFollower(reply.Term)
+				rf.convertToFollower(reply.Term, -1)
 			}
 			if reply.VoteGranted {
 				fmt.Printf("####Server%d任期%d投票给Candidate%d任期%d\n", server, reply.Term, rf.me, rf.currentTerm)
@@ -553,11 +533,11 @@ func (rf *Raft) startElection() {
 				return
 			}
 			done = true
-			if rf.currentTerm == term && rf.role == Candidate && countVote > len(rf.peers)/2 {
+			if rf.currentTerm == term && rf.role == Candidate {
 				// 服务器还是选举刚开始时的任期, 还是Candidate, 获得了过半的投票, 变成Leader
 				fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
 				rf.mu.Unlock()
-				rf.becomeLeader()
+				go rf.becomeLeader()
 			} else {
 				rf.mu.Unlock()
 			}
@@ -600,12 +580,12 @@ func (rf *Raft) expired() bool {
 /**
  * @Description: 调用时必须持有锁
  * @param newTerm 新的任期
+ * @param newVotedFor 投票服务器
  */
-func (rf *Raft) convertToFollower(newTerm int) {
-	// 每次状态变为Follower都要把投票改成-1
+func (rf *Raft) convertToFollower(newTerm, newVotedFor int) {
 	rf.currentTerm = newTerm
 	rf.role = Follower
-	rf.votedFor = -1
+	rf.votedFor = newVotedFor
 	rf.resetTimeout()
 }
 
@@ -628,7 +608,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.convertToFollower(0)
+	rf.convertToFollower(0, -1)
 	rf.cond = sync.NewCond(&rf.mu)
 
 	go rf.checkElectLoop()
