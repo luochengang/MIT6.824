@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -227,7 +226,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if rf.currentTerm < args.Term {
 		if rf.role == Leader {
-			fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, args.Term)
+			//fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, args.Term)
 		}
 		rf.convertToFollower(args.Term, -1)
 	}
@@ -239,10 +238,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		(args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
 			args.LastLogIndex >= len(rf.log))) {
-		fmt.Printf("####Server%d最后日志任期%d给Candidate%d最后日志任期%d投票\n", rf.me,
-			getLastLogTerm(rf.log), args.CandidateId, args.LastLogTerm)
-		fmt.Printf("####此时Server%d的日志为%+v\n", rf.me,
-			rf.log)
+		/*
+			fmt.Printf("####Server%d最后日志任期%d给Candidate%d最后日志任期%d投票\n", rf.me,
+				getLastLogTerm(rf.log), args.CandidateId, args.LastLogTerm)
+			fmt.Printf("####此时Server%d的日志为%+v\n", rf.me,
+				rf.log)
+		*/
 		rf.convertToFollower(args.Term, args.CandidateId)
 		reply.VoteGranted = true
 	}
@@ -253,17 +254,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 
-	if rf.role == Leader {
-		fmt.Printf("####出现了两个Leader#Leader%d任期%d#Leader%d任期%d\n", rf.me, rf.currentTerm, args.LeaderId,
-			args.Term)
-	}
 	// Leader任期 < Follower任期
 	if args.Term < rf.currentTerm {
 		return
 	}
 	rf.convertToFollower(args.Term, args.LeaderId)
-	//fmt.Printf("####Server%d任期%d收到的日志长度为%d\n", rf.me, rf.currentTerm, len(args.Entries))
-	fmt.Printf("####Server%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
+	//fmt.Printf("####Server%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 
 	if args.PrevLogIndex == 0 {
 		reply.Success = true
@@ -276,18 +272,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 	} else if rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm {
 		reply.Success = true
-		if len(args.Entries) > 0 {
-			fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
-		}
+		/*
+			if len(args.Entries) > 0 {
+				fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
+			}
+		*/
 		// 复制log到Follower
 		rf.log = rf.log[:args.PrevLogIndex]
 		for _, v := range args.Entries {
 			rf.log = append(rf.log, v)
 		}
-		if len(args.Entries) > 0 {
-			fmt.Printf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
-			fmt.Printf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
-		}
+		/*
+			if len(args.Entries) > 0 {
+				fmt.Printf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
+				fmt.Printf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
+			}
+		*/
 	} else {
 		reply.Success = false
 	}
@@ -296,7 +296,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if reply.Success {
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, len(rf.log))
-			fmt.Printf("####Server%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, rf.commitIndex)
+			//fmt.Printf("####Server%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, rf.commitIndex)
 			// 这里已经用rf.mu.Lock()加锁了, 不需要再用rf.cond.L.Lock()加锁, 否则会导致死锁
 			rf.cond.Signal()
 		}
@@ -414,7 +414,7 @@ func getLastLogTerm(log []Log) int {
  */
 func (rf *Raft) appendLog() {
 	rf.mu.Lock()
-	fmt.Printf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
+	//fmt.Printf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 	rf.mu.Unlock()
 	for i := range rf.peers {
 		// 不用给自己发心跳
@@ -463,7 +463,7 @@ func (rf *Raft) appendLog() {
 				return
 			}
 			if reply.Term > rf.currentTerm {
-				fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, reply.Term)
+				//fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, reply.Term)
 				rf.convertToFollower(reply.Term, -1)
 				return
 			}
@@ -522,10 +522,12 @@ func (rf *Raft) updateLeaderCommitIndex() {
 	if rf.role != Leader {
 		return
 	}
-	for idx, v := range rf.matchIndex {
-		fmt.Printf("####Server%d任期%d的matchIndex是%d\n", idx, rf.currentTerm, v)
-		//fmt.Printf("####Server%d任期%d的nextIndex是%d\n", idx, rf.currentTerm, rf.nextIndex[idx])
-	}
+	/*
+		for idx, v := range rf.matchIndex {
+			fmt.Printf("####Server%d任期%d的matchIndex是%d\n", idx, rf.currentTerm, v)
+			//fmt.Printf("####Server%d任期%d的nextIndex是%d\n", idx, rf.currentTerm, rf.nextIndex[idx])
+		}
+	*/
 
 	maxCommitIdx := len(rf.log)
 	for maxCommitIdx > 0 {
@@ -539,7 +541,7 @@ func (rf *Raft) updateLeaderCommitIndex() {
 		// 只有当前任期的log用统计是否过半来决定是否commit, 之前任期的log被动commit
 		if replicaCnt > len(rf.peers)/2 && rf.log[maxCommitIdx-1].Term == rf.currentTerm &&
 			maxCommitIdx > rf.commitIndex {
-			fmt.Printf("####Leader%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, maxCommitIdx)
+			//fmt.Printf("####Leader%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, maxCommitIdx)
 			rf.commitIndex = maxCommitIdx
 			rf.cond.Signal()
 			return
@@ -565,7 +567,7 @@ func (rf *Raft) startElection() {
 	// 如果只有1台服务器
 	if len(rf.peers) == 1 {
 		// 服务器还是选举刚开始时的任期, 还是Candidate, 获得了过半的投票, 变成Leader
-		fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
+		//fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
 		rf.mu.Unlock()
 		go rf.becomeLeader()
 		return
@@ -611,7 +613,7 @@ func (rf *Raft) startElection() {
 				rf.convertToFollower(reply.Term, -1)
 			}
 			if reply.VoteGranted {
-				fmt.Printf("####Server%d任期%d投票给Candidate%d任期%d\n", server, reply.Term, rf.me, rf.currentTerm)
+				//fmt.Printf("####Server%d任期%d投票给Candidate%d任期%d\n", server, reply.Term, rf.me, rf.currentTerm)
 				countVote++
 			}
 
@@ -622,7 +624,7 @@ func (rf *Raft) startElection() {
 			done = true
 			if rf.currentTerm == term {
 				// 服务器还是选举刚开始时的任期, 还是Candidate, 获得了过半的投票, 变成Leader
-				fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
+				//fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
 				rf.mu.Unlock()
 				go rf.becomeLeader()
 			} else {
