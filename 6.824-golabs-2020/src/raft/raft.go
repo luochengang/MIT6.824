@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -26,7 +28,7 @@ import "sync/atomic"
 import "../labrpc"
 
 // import "bytes"
-// import "../labgob"
+import "../labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -143,6 +145,9 @@ func min(a, b int) int {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
+/**
+ * @Description: 在实现更改持久状态的点插入对 persist() 的调用, 调用时必须持有锁
+ */
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -152,6 +157,25 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	err := e.Encode(rf.currentTerm)
+	if err != nil {
+		fmt.Printf("####Server%d编码任期%d失败\n", rf.me, rf.currentTerm)
+	}
+	err = e.Encode(rf.votedFor)
+	if err != nil {
+		fmt.Printf("####Server%d编码投票%d失败\n", rf.me, rf.votedFor)
+	}
+	err = e.Encode(rf.log)
+	if err != nil {
+		fmt.Printf("####Server%d编码日志%+v失败\n", rf.me, rf.log)
+	}
+	data := w.Bytes()
+	//fmt.Printf("####Server%d持久化任期%d投票%d日志%+v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log)
+	fmt.Printf("####Server%d持久化任期%d投票%d日志长度%d\n", rf.me, rf.currentTerm, rf.votedFor, len(rf.log))
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -174,6 +198,23 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor int
+	var log []Log
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		fmt.Println("####decode error")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+		//fmt.Printf("####Server%d读取任期%d投票%d日志%+v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log)
+		fmt.Printf("####Server%d读取任期%d投票%d日志长度%d\n", rf.me, rf.currentTerm, rf.votedFor, len(rf.log))
+	}
 }
 
 //
@@ -232,8 +273,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	/*
-		根据日志新的程度决定是否投票
-		这里的rf.votedFor == args.CandidateId是考虑RPC响应可能丢失的情况
+			根据日志新的程度决定是否投票
+		    这里需要考虑RPC响应失败后, 收到相同RPC的情况, 不过这里是幂等的
+			这里的rf.votedFor == args.CandidateId就是考虑RPC响应可能丢失的情况
 	*/
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		(args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
@@ -277,6 +319,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
 			}
 		*/
+		// 这里需要考虑RPC响应失败后, 收到相同RPC的情况, 不过这里是幂等的
 		// 复制log到Follower
 		rf.log = rf.log[:args.PrevLogIndex]
 		for _, v := range args.Entries {
@@ -292,8 +335,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 	}
 
-	// 服务器只在日志和Leader匹配的情况下更新commitIndex
+	// 服务器只在日志和Leader匹配的情况下更新commitIndex和持久化
 	if reply.Success {
+		if len(args.Entries) > 0 {
+			// 只在日志匹配并且发生变化时持久化, 心跳时不需要持久化
+			rf.persist()
+		}
+
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, len(rf.log))
 			//fmt.Printf("####Server%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, rf.commitIndex)
@@ -374,6 +422,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.currentTerm
 	rf.matchIndex[rf.me] = len(rf.log)
 	rf.nextIndex[rf.me] = len(rf.log) + 1
+	rf.persist()
 	rf.mu.Unlock()
 
 	rf.appendLog()
@@ -413,9 +462,9 @@ func getLastLogTerm(log []Log) int {
  * @Description: Leader给其他服务器发送心跳消息
  */
 func (rf *Raft) appendLog() {
-	rf.mu.Lock()
-	//fmt.Printf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
-	rf.mu.Unlock()
+	/*	rf.mu.Lock()
+		fmt.Printf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
+		rf.mu.Unlock()*/
 	for i := range rf.peers {
 		// 不用给自己发心跳
 		if i == rf.me {
@@ -561,6 +610,7 @@ func (rf *Raft) startElection() {
 	rf.role = Candidate
 	rf.votedFor = rf.me
 	rf.resetTimeout()
+	rf.persist()
 
 	countVote := 1
 	done := false
@@ -672,10 +722,17 @@ func (rf *Raft) expired() bool {
  * @param newVotedFor 投票服务器
  */
 func (rf *Raft) convertToFollower(newTerm, newVotedFor int) {
+	preTerm := rf.currentTerm
+	preVotedFor := rf.votedFor
+
 	rf.currentTerm = newTerm
 	rf.role = Follower
 	rf.votedFor = newVotedFor
 	rf.resetTimeout()
+	// 只在任期或者投票发生变化时持久化
+	if preTerm != newTerm || preVotedFor != newVotedFor {
+		rf.persist()
+	}
 }
 
 /**
@@ -727,16 +784,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.convertToFollower(0, -1)
+	//这里不能直接调用rf.convertToFollower(0, -1), 否则会导致调用rf.persist()而覆盖之前的持久化结果
+	rf.currentTerm = 0
+	rf.role = Follower
+	rf.votedFor = -1
+	rf.resetTimeout()
 	rf.cond = sync.NewCond(&rf.mu)
 	rf.applyCh = applyCh
+
+	// initialize from state persisted before a crash
+	// 先读取持久化存储, 再调用后面的方法
+	rf.readPersist(persister.ReadRaftState())
 
 	go rf.checkElectLoop()
 	// 应用已经提交的日志
 	go rf.applyCommittedEntries()
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	return rf
 }
