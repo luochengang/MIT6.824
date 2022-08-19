@@ -174,7 +174,7 @@ func (rf *Raft) persist() {
 	}
 	data := w.Bytes()
 	//fmt.Printf("####Server%d持久化任期%d投票%d日志%+v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log)
-	fmt.Printf("####Server%d持久化任期%d投票%d日志长度%d\n", rf.me, rf.currentTerm, rf.votedFor, len(rf.log))
+	//fmt.Printf("####Server%d持久化任期%d投票%d日志长度%d\n", rf.me, rf.currentTerm, rf.votedFor, len(rf.log))
 	rf.persister.SaveRaftState(data)
 }
 
@@ -213,7 +213,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = votedFor
 		rf.log = log
 		//fmt.Printf("####Server%d读取任期%d投票%d日志%+v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log)
-		fmt.Printf("####Server%d读取任期%d投票%d日志长度%d\n", rf.me, rf.currentTerm, rf.votedFor, len(rf.log))
+		//fmt.Printf("####Server%d读取任期%d投票%d日志长度%d\n", rf.me, rf.currentTerm, rf.votedFor, len(rf.log))
 	}
 }
 
@@ -267,7 +267,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if rf.currentTerm < args.Term {
 		if rf.role == Leader {
-			//fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, args.Term)
+			fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, args.Term)
 		}
 		rf.convertToFollower(args.Term, -1)
 	}
@@ -280,17 +280,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		(args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
 			args.LastLogIndex >= len(rf.log))) {
-		/*
-			fmt.Printf("####Server%d最后日志任期%d给Candidate%d最后日志任期%d投票\n", rf.me,
-				getLastLogTerm(rf.log), args.CandidateId, args.LastLogTerm)
-			fmt.Printf("####此时Server%d的日志为%+v\n", rf.me,
-				rf.log)
-		*/
+		fmt.Printf("####Server%d最后日志任期%d给Candidate%d最后日志任期%d投票\n", rf.me,
+			getLastLogTerm(rf.log), args.CandidateId, args.LastLogTerm)
+		//fmt.Printf("####此时Server%d的日志为%+v\n", rf.me, rf.log)
+
 		rf.convertToFollower(args.Term, args.CandidateId)
 		reply.VoteGranted = true
 	}
 }
 
+/*
+	如果在不同的日志中的两个条目拥有相同的索引和任期号，那么他们存储了相同的指令
+	如果在不同的日志中的两个条目拥有相同的索引和任期号，那么他们之前的所有日志条目也全部相同
+	先发出的AppendEntries RPC不一定先到达
+*/
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -303,51 +306,58 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.convertToFollower(args.Term, args.LeaderId)
 	//fmt.Printf("####Server%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 
+	preLogLen := len(rf.log)
 	if args.PrevLogIndex == 0 {
 		reply.Success = true
 		// 复制log到Follower
 		rf.log = nil
-		for _, v := range args.Entries {
-			rf.log = append(rf.log, v)
-		}
+		rf.log = append(rf.log, args.Entries...)
 	} else if args.PrevLogIndex > len(rf.log) {
-		reply.Success = false
+		return
 	} else if rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm {
 		reply.Success = true
 		/*
+			暂时
 			if len(args.Entries) > 0 {
 				fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
 			}
 		*/
 		// 这里需要考虑RPC响应失败后, 收到相同RPC的情况, 不过这里是幂等的
-		// 复制log到Follower
+		/*
+			复制log到Follower
+			Figure7: 对于Follower c和d，如果收到了leader发送的AppendEntries RPC，会把leader没有的那部分日志删除;
+			如果Leader向Follower发送了第一个AppendEntries RPC，然后Leader在日志中新增了一个条目，然后Leader向Follower发送了
+			第二个AppendEntries RPC，但是第二个RPC比第一个先到。那么Follower收到第一个RPC时，需要把已经添加到日志中的条目给删除
+		*/
 		rf.log = rf.log[:args.PrevLogIndex]
-		for _, v := range args.Entries {
-			rf.log = append(rf.log, v)
-		}
+		rf.log = append(rf.log, args.Entries...)
 		/*
 			if len(args.Entries) > 0 {
 				fmt.Printf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
 				fmt.Printf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
 			}
+			暂时
 		*/
 	} else {
-		reply.Success = false
+		return
 	}
 
 	// 服务器只在日志和Leader匹配的情况下更新commitIndex和持久化
-	if reply.Success {
-		if len(args.Entries) > 0 {
-			// 只在日志匹配并且发生变化时持久化, 心跳时不需要持久化
-			rf.persist()
-		}
-
-		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(args.LeaderCommit, len(rf.log))
-			//fmt.Printf("####Server%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, rf.commitIndex)
-			// 这里已经用rf.mu.Lock()加锁了, 不需要再用rf.cond.L.Lock()加锁, 否则会导致死锁
-			rf.cond.Signal()
-		}
+	if len(args.Entries) > 0 || preLogLen != len(rf.log) {
+		/*
+			只在日志匹配并且发生变化时持久化, 心跳时不需要持久化
+			这里可能args.Entries长度为0也需要持久化, 比如Figure7的c和d
+		*/
+		fmt.Printf("####Server%d任期%d的日志长度由%d变更为%d\n", rf.me, rf.currentTerm, preLogLen, len(rf.log))
+		rf.persist()
+	}
+	// rf.commitIndex可能变小, 然后导致越界错误
+	rf.commitIndex = min(rf.commitIndex, len(rf.log))
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log))
+		fmt.Printf("####Server%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, rf.commitIndex)
+		// 这里已经用rf.mu.Lock()加锁了, 不需要再用rf.cond.L.Lock()加锁, 否则会导致死锁
+		rf.cond.Signal()
 	}
 }
 
@@ -462,9 +472,9 @@ func getLastLogTerm(log []Log) int {
  * @Description: Leader给其他服务器发送心跳消息
  */
 func (rf *Raft) appendLog() {
-	/*	rf.mu.Lock()
-		fmt.Printf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
-		rf.mu.Unlock()*/
+	rf.mu.Lock()
+	//暂时fmt.Printf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
+	rf.mu.Unlock()
 	for i := range rf.peers {
 		// 不用给自己发心跳
 		if i == rf.me {
@@ -512,7 +522,7 @@ func (rf *Raft) appendLog() {
 				return
 			}
 			if reply.Term > rf.currentTerm {
-				//fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, reply.Term)
+				fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, reply.Term)
 				rf.convertToFollower(reply.Term, -1)
 				return
 			}
@@ -571,12 +581,10 @@ func (rf *Raft) updateLeaderCommitIndex() {
 	if rf.role != Leader {
 		return
 	}
-	/*
-		for idx, v := range rf.matchIndex {
-			fmt.Printf("####Server%d任期%d的matchIndex是%d\n", idx, rf.currentTerm, v)
-			//fmt.Printf("####Server%d任期%d的nextIndex是%d\n", idx, rf.currentTerm, rf.nextIndex[idx])
-		}
-	*/
+	for idx, v := range rf.matchIndex {
+		fmt.Printf("####Server%d任期%d的matchIndex是%d\n", idx, rf.currentTerm, v)
+		//fmt.Printf("####Server%d任期%d的nextIndex是%d\n", idx, rf.currentTerm, rf.nextIndex[idx])
+	}
 
 	maxCommitIdx := len(rf.log)
 	for maxCommitIdx > 0 {
@@ -590,7 +598,7 @@ func (rf *Raft) updateLeaderCommitIndex() {
 		// 只有当前任期的log用统计是否过半来决定是否commit, 之前任期的log被动commit
 		if replicaCnt > len(rf.peers)/2 && rf.log[maxCommitIdx-1].Term == rf.currentTerm &&
 			maxCommitIdx > rf.commitIndex {
-			//fmt.Printf("####Leader%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, maxCommitIdx)
+			fmt.Printf("####Leader%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, maxCommitIdx)
 			rf.commitIndex = maxCommitIdx
 			rf.cond.Signal()
 			return
@@ -617,7 +625,7 @@ func (rf *Raft) startElection() {
 	// 如果只有1台服务器
 	if len(rf.peers) == 1 {
 		// 服务器还是选举刚开始时的任期, 还是Candidate, 获得了过半的投票, 变成Leader
-		//fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
+		fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
 		rf.mu.Unlock()
 		go rf.becomeLeader()
 		return
@@ -663,7 +671,7 @@ func (rf *Raft) startElection() {
 				rf.convertToFollower(reply.Term, -1)
 			}
 			if reply.VoteGranted {
-				//fmt.Printf("####Server%d任期%d投票给Candidate%d任期%d\n", server, reply.Term, rf.me, rf.currentTerm)
+				fmt.Printf("####Server%d任期%d投票给Candidate%d任期%d\n", server, reply.Term, rf.me, rf.currentTerm)
 				countVote++
 			}
 
@@ -674,7 +682,7 @@ func (rf *Raft) startElection() {
 			done = true
 			if rf.currentTerm == term {
 				// 服务器还是选举刚开始时的任期, 还是Candidate, 获得了过半的投票, 变成Leader
-				//fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
+				fmt.Printf("####Candidate%d任期%d成为Leader\n", rf.me, rf.currentTerm)
 				rf.mu.Unlock()
 				go rf.becomeLeader()
 			} else {
@@ -746,11 +754,17 @@ func (rf *Raft) applyCommittedEntries() {
 			rf.cond.Wait()
 		}
 
-		cnt := rf.commitIndex - rf.lastApplied
-		//fmt.Printf("####Server%d任期%d需要提交新日志\n", rf.me, rf.currentTerm)
 		rf.mu.Unlock()
-		for i := 0; i < cnt; i++ {
+		for {
 			rf.mu.Lock()
+			if rf.commitIndex <= rf.lastApplied {
+				rf.mu.Unlock()
+				break
+			}
+			/*
+				fmt.Printf("####Server%d任期%d日志长度%dcommitIndex%dlastApplied%d\n", rf.me, rf.currentTerm,
+					len(rf.log), rf.commitIndex, rf.lastApplied)
+			*/
 			applyMsg := ApplyMsg{CommandValid: true,
 				Command:      rf.log[rf.lastApplied].Command,
 				CommandIndex: rf.lastApplied + 1}
