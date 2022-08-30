@@ -262,9 +262,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 
+	// 1. Reply false if term < currentTerm (§5.1)
 	if rf.currentTerm > args.Term {
 		return
 	}
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
 	if rf.currentTerm < args.Term {
 		if rf.role == Leader {
 			fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, args.Term)
@@ -277,6 +280,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		    这里需要考虑RPC响应失败后, 收到相同RPC的情况, 不过这里是幂等的
 			这里的rf.votedFor == args.CandidateId就是考虑RPC响应可能丢失的情况
 	*/
+	// 2. If votedFor is null or candidateId, and candidate’s log is at
+	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		(args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
 			args.LastLogIndex >= len(rf.log))) {
@@ -300,9 +305,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 
 	// Leader任期 < Follower任期
+	// 1. Reply false if term < currentTerm (§5.1)
 	if args.Term < rf.currentTerm {
 		return
 	}
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
 	rf.convertToFollower(args.Term, args.LeaderId)
 	//fmt.Printf("####Server%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 
@@ -310,9 +318,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex == 0 {
 		reply.Success = true
 		// 复制log到Follower
+		// 3. If an existing entry conflicts with a new one (same index
+		// but different terms), delete the existing entry and all that
+		// follow it (§5.3)
 		rf.log = nil
 		rf.log = append(rf.log, args.Entries...)
 	} else if args.PrevLogIndex > len(rf.log) {
+		// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 		return
 	} else if rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm {
 		reply.Success = true
@@ -329,6 +341,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			如果Leader向Follower发送了第一个AppendEntries RPC，然后Leader在日志中新增了一个条目，然后Leader向Follower发送了
 			第二个AppendEntries RPC，但是第二个RPC比第一个先到。那么Follower收到第一个RPC时，需要把已经添加到日志中的条目给删除
 		*/
+		// 3. If an existing entry conflicts with a new one (same index
+		// but different terms), delete the existing entry and all that
+		// follow it (§5.3)
 		rf.log = rf.log[:args.PrevLogIndex]
 		rf.log = append(rf.log, args.Entries...)
 		/*
@@ -339,6 +354,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			暂时
 		*/
 	} else {
+		// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 		return
 	}
 
@@ -353,6 +369,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// rf.commitIndex可能变小, 然后导致越界错误
 	rf.commitIndex = min(rf.commitIndex, len(rf.log))
+	// 5. If leaderCommit > commitIndex, set commitIndex =
+	// min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log))
 		fmt.Printf("####Server%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, rf.commitIndex)
@@ -521,6 +539,8 @@ func (rf *Raft) appendLog() {
 			if rf.role != Leader {
 				return
 			}
+			// If RPC request or response contains term T > currentTerm:
+			// set currentTerm = T, convert to follower (§5.1)
 			if reply.Term > rf.currentTerm {
 				fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, reply.Term)
 				rf.convertToFollower(reply.Term, -1)
@@ -667,6 +687,8 @@ func (rf *Raft) startElection() {
 				return
 			}
 			// 如果RPC响应的任期号比自己更新, 那么变成Follower
+			// If RPC request or response contains term T > currentTerm:
+			// set currentTerm = T, convert to follower (§5.1)
 			if reply.Term > rf.currentTerm {
 				rf.convertToFollower(reply.Term, -1)
 			}
@@ -765,6 +787,8 @@ func (rf *Raft) applyCommittedEntries() {
 				fmt.Printf("####Server%d任期%d日志长度%dcommitIndex%dlastApplied%d\n", rf.me, rf.currentTerm,
 					len(rf.log), rf.commitIndex, rf.lastApplied)
 			*/
+			// If commitIndex > lastApplied: increment lastApplied, apply
+			// log[lastApplied] to state machine (§5.3)
 			applyMsg := ApplyMsg{CommandValid: true,
 				Command:      rf.log[rf.lastApplied].Command,
 				CommandIndex: rf.lastApplied + 1}
