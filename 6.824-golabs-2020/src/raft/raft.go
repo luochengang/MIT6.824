@@ -285,10 +285,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		(args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
 			args.LastLogIndex >= len(rf.log))) {
-		fmt.Printf("####Server%d最后日志任期%d给Candidate%d最后日志任期%d投票\n", rf.me,
-			getLastLogTerm(rf.log), args.CandidateId, args.LastLogTerm)
-		//fmt.Printf("####此时Server%d的日志为%+v\n", rf.me, rf.log)
-
+		/*
+			fmt.Printf("####Server%d最后日志任期%d给Candidate%d最后日志任期%d投票\n", rf.me,
+				getLastLogTerm(rf.log), args.CandidateId, args.LastLogTerm)
+			fmt.Printf("####此时Server%d的日志为%+v\n", rf.me, rf.log)
+		*/
 		rf.convertToFollower(args.Term, args.CandidateId)
 		reply.VoteGranted = true
 	}
@@ -317,23 +318,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	preLogLen := len(rf.log)
 	if args.PrevLogIndex == 0 {
 		reply.Success = true
+		fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
 		// 复制log到Follower
 		// 3. If an existing entry conflicts with a new one (same index
 		// but different terms), delete the existing entry and all that
 		// follow it (§5.3)
 		rf.log = nil
 		rf.log = append(rf.log, args.Entries...)
+		fmt.Printf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
+		fmt.Printf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
 	} else if args.PrevLogIndex > len(rf.log) {
 		// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 		return
 	} else if rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm {
 		reply.Success = true
-		/*
-			暂时
-			if len(args.Entries) > 0 {
-				fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
-			}
-		*/
+		if len(args.Entries) > 0 {
+			fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
+		}
 		// 这里需要考虑RPC响应失败后, 收到相同RPC的情况, 不过这里是幂等的
 		/*
 			复制log到Follower
@@ -346,13 +347,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// follow it (§5.3)
 		rf.log = rf.log[:args.PrevLogIndex]
 		rf.log = append(rf.log, args.Entries...)
-		/*
-			if len(args.Entries) > 0 {
-				fmt.Printf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
-				fmt.Printf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
-			}
-			暂时
-		*/
+		if len(args.Entries) > 0 {
+			fmt.Printf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
+			fmt.Printf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
+		}
 	} else {
 		// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 		return
@@ -364,7 +362,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			只在日志匹配并且发生变化时持久化, 心跳时不需要持久化
 			这里可能args.Entries长度为0也需要持久化, 比如Figure7的c和d
 		*/
-		fmt.Printf("####Server%d任期%d的日志长度由%d变更为%d\n", rf.me, rf.currentTerm, preLogLen, len(rf.log))
+		//fmt.Printf("####Server%d任期%d的日志长度由%d变更为%d\n", rf.me, rf.currentTerm, preLogLen, len(rf.log))
 		rf.persist()
 	}
 	// rf.commitIndex可能变小, 然后导致越界错误
@@ -491,7 +489,7 @@ func getLastLogTerm(log []Log) int {
  */
 func (rf *Raft) appendLog() {
 	rf.mu.Lock()
-	//暂时fmt.Printf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
+	fmt.Printf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 	rf.mu.Unlock()
 	for i := range rf.peers {
 		// 不用给自己发心跳
