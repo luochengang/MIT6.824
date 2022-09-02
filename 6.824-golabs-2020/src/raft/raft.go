@@ -316,55 +316,53 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//fmt.Printf("####Server%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 
 	preLogLen := len(rf.log)
-	if args.PrevLogIndex == 0 {
-		reply.Success = true
-		fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
-		// 复制log到Follower
-		// 3. If an existing entry conflicts with a new one (same index
-		// but different terms), delete the existing entry and all that
-		// follow it (§5.3)
-		rf.log = nil
-		rf.log = append(rf.log, args.Entries...)
-		fmt.Printf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
-		fmt.Printf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
-	} else if args.PrevLogIndex > len(rf.log) {
-		// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
-		return
-	} else if rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm {
-		reply.Success = true
-		if len(args.Entries) > 0 {
-			fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
-		}
-		// 这里需要考虑RPC响应失败后, 收到相同RPC的情况, 不过这里是幂等的
-		/*
-			复制log到Follower
-			Figure7: 对于Follower c和d，如果收到了leader发送的AppendEntries RPC，会把leader没有的那部分日志删除;
-			如果Leader向Follower发送了第一个AppendEntries RPC，然后Leader在日志中新增了一个条目，然后Leader向Follower发送了
-			第二个AppendEntries RPC，但是第二个RPC比第一个先到。那么Follower收到第一个RPC时，需要把已经添加到日志中的条目给删除
-		*/
-		// 3. If an existing entry conflicts with a new one (same index
-		// but different terms), delete the existing entry and all that
-		// follow it (§5.3)
-		rf.log = rf.log[:args.PrevLogIndex]
-		rf.log = append(rf.log, args.Entries...)
-		if len(args.Entries) > 0 {
-			fmt.Printf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
-			fmt.Printf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
-		}
-	} else {
+	if args.PrevLogIndex != 0 && (args.PrevLogIndex > len(rf.log) || rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
 		// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 		return
 	}
 
-	// 服务器只在日志和Leader匹配的情况下更新commitIndex和持久化
+	reply.Success = true
+	idx := 0
+	for args.PrevLogIndex+idx < len(rf.log) && idx < len(args.Entries) &&
+		rf.log[args.PrevLogIndex+idx].Term == args.Entries[idx].Term {
+		idx++
+	}
+	args.Entries = args.Entries[idx:]
+	/*
+		暂时
+		if len(args.Entries) > 0 {
+				fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
+			}
+	*/
+	// 这里需要考虑RPC响应失败后, 收到相同RPC的情况, 不过这里是幂等的
+	/*
+		复制log到Follower
+		Figure7: 对于Follower c和d，如果收到了leader发送的AppendEntries RPC，会把leader没有的那部分日志删除;
+		如果Leader向Follower发送了第一个AppendEntries RPC，然后Leader在日志中新增了一个条目，然后Leader向Follower发送了
+		第二个AppendEntries RPC，但是第二个RPC比第一个先到。那么Follower收到第一个RPC时，需要把已经添加到日志中的条目给删除
+	*/
+	// 3. If an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that
+	// follow it (§5.3)
+	//fmt.Printf("####Server%d任期%d的日志长度由%d变更为%d\n", rf.me, rf.currentTerm, preLogLen, len(rf.log))
+	rf.log = rf.log[:args.PrevLogIndex+idx]
+	rf.log = append(rf.log, args.Entries...)
 	if len(args.Entries) > 0 || preLogLen != len(rf.log) {
 		/*
 			只在日志匹配并且发生变化时持久化, 心跳时不需要持久化
 			这里可能args.Entries长度为0也需要持久化, 比如Figure7的c和d
 		*/
-		//fmt.Printf("####Server%d任期%d的日志长度由%d变更为%d\n", rf.me, rf.currentTerm, preLogLen, len(rf.log))
 		rf.persist()
 	}
+	/*
+		暂时
+		if len(args.Entries) > 0 {
+				fmt.Printf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
+				fmt.Printf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
+			}
+	*/
+
+	// 服务器只在日志和Leader匹配的情况下更新commitIndex
 	// rf.commitIndex可能变小, 然后导致越界错误
 	rf.commitIndex = min(rf.commitIndex, len(rf.log))
 	// 5. If leaderCommit > commitIndex, set commitIndex =
@@ -438,7 +436,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	rf.mu.Lock()
-	if rf.role != Leader {
+	if rf.role != Leader || rf.killed() {
 		rf.mu.Unlock()
 		return index, term, false
 	}
@@ -489,7 +487,7 @@ func getLastLogTerm(log []Log) int {
  */
 func (rf *Raft) appendLog() {
 	rf.mu.Lock()
-	fmt.Printf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
+	//暂时fmt.Printf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 	rf.mu.Unlock()
 	for i := range rf.peers {
 		// 不用给自己发心跳
@@ -520,7 +518,6 @@ func (rf *Raft) appendLog() {
 				PrevLogTerm:  prevLogTerm,
 				Entries:      entries,
 				LeaderCommit: rf.commitIndex}
-			nextIdx := rf.nextIndex[server]
 			rf.mu.Unlock()
 			reply := &AppendEntriesReply{}
 			//fmt.Printf("####Leader%d任期%d发出的日志长度为%d\n", rf.me, rf.currentTerm, len(args.Entries))
@@ -533,10 +530,6 @@ func (rf *Raft) appendLog() {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			// 这里再次获取锁以后, 可能已经不是leader了
-			if rf.role != Leader {
-				return
-			}
 			// If RPC request or response contains term T > currentTerm:
 			// set currentTerm = T, convert to follower (§5.1)
 			if reply.Term > rf.currentTerm {
@@ -544,18 +537,18 @@ func (rf *Raft) appendLog() {
 				rf.convertToFollower(reply.Term, -1)
 				return
 			}
-
-			// 这里的rf.nextIndex[server]可能和发送RPC之前的rf.nextIndex[server]不一样了
-			if rf.nextIndex[server] != nextIdx {
+			// 这里再次获取锁以后, 可能已经不是leader了
+			if rf.role != Leader {
 				return
 			}
+
 			// 这里不需要统计是否半数以上服务器返回了成功
 			if reply.Success {
-				rf.nextIndex[server] += len(entries)
-				rf.matchIndex[server] = rf.nextIndex[server] - 1
+				rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+				rf.nextIndex[server] = rf.matchIndex[server] + 1
 			} else {
-				if rf.nextIndex[server] > 1 {
-					rf.nextIndex[server]--
+				if args.PrevLogIndex > 0 {
+					rf.nextIndex[server] = args.PrevLogIndex
 				}
 			}
 		}(i)
