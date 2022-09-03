@@ -251,6 +251,14 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // currentTerm, for leader to update itself
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+
+	/*
+		for fallback optimization
+		2C需要实现回退优化, 否则有几个测试用例无法通过
+	*/
+	LogLength              int // follower's log length
+	ConflictTerm           int // follower's term of conflict entry
+	ConflictTermFirstIndex int // index of the first entry of the ConflictTerm term
 }
 
 //
@@ -304,6 +312,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+	reply.LogLength = -1
+	reply.ConflictTerm = -1
+	reply.ConflictTermFirstIndex = -1
 
 	// Leader任期 < Follower任期
 	// 1. Reply false if term < currentTerm (§5.1)
@@ -317,6 +328,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	preLogLen := len(rf.log)
 	if args.PrevLogIndex != 0 && (args.PrevLogIndex > len(rf.log) || rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+		reply.LogLength = len(rf.log)
+		if args.PrevLogIndex <= len(rf.log) {
+			reply.ConflictTerm = rf.log[args.PrevLogIndex-1].Term
+			reply.ConflictTermFirstIndex = rf.firstIndex(0, args.PrevLogIndex-1, reply.ConflictTerm)
+		}
 		// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 		return
 	}
@@ -547,8 +563,27 @@ func (rf *Raft) appendLog() {
 				rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 				rf.nextIndex[server] = rf.matchIndex[server] + 1
 			} else {
-				if args.PrevLogIndex > 0 {
-					rf.nextIndex[server] = args.PrevLogIndex
+				if reply.LogLength < args.PrevLogIndex {
+					// follower的prevLogIndex位置没有日志, 直接从follower的日志下一个位置开始复制
+					rf.nextIndex[server] = reply.LogLength + 1
+				} else {
+					lastIndex := rf.lastIndex(0, args.PrevLogIndex-1, reply.ConflictTerm)
+					if lastIndex != 0 {
+						/*
+							如果leader.log找到了Term为conflictTerm的日志，则下一次从leader.log中conflictTerm的
+							最后一个日志的下一个位置开始同步日志
+						*/
+						rf.nextIndex[server] = lastIndex + 1
+					} else {
+						/*
+							如果leader.log找不到Term为conflictTerm的日志，则下一次从follower.log中conflictTerm的
+							第一个entry的位置开始同步日志;
+							此时需要把leader的日志同步给follower, 而follower任期reply.ConflictTerm的日志leader甚至没有, 所以
+							需要把follower任期reply.ConflictTerm的日志全部覆盖, 所以从follower任期reply.ConflictTerm的第一条
+							日志开始复制
+						*/
+						rf.nextIndex[server] = reply.ConflictTermFirstIndex
+					}
 				}
 			}
 		}(i)
@@ -616,6 +651,52 @@ func (rf *Raft) updateLeaderCommitIndex() {
 		}
 		maxCommitIdx--
 	}
+}
+
+/**
+ * @Description: 返回某任期的第一条日志的索引(以1开始, 返回0代表没有该任期的日志)
+ * @param left 日志最左边的索引
+ * @param right 日志最右边的索引
+ * @param term 任期
+ * @return int 该任期的第一条日志的索引
+ */
+func (rf *Raft) firstIndex(left, right, term int) int {
+	result := -1
+	for left <= right {
+		mid := (left + right) / 2
+		if rf.log[mid].Term > term {
+			right = mid - 1
+		} else if rf.log[mid].Term < term {
+			left = mid + 1
+		} else {
+			result = mid
+			right = mid - 1
+		}
+	}
+	return result + 1
+}
+
+/**
+ * @Description: 返回某任期的最后一条日志的索引(以1开始, 返回0代表没有该任期的日志)
+ * @param left 日志最左边的索引
+ * @param right 日志最右边的索引
+ * @param term 任期
+ * @return int 该任期的最后一条日志的索引
+ */
+func (rf *Raft) lastIndex(left, right, term int) int {
+	result := -1
+	for left <= right {
+		mid := (left + right) / 2
+		if rf.log[mid].Term > term {
+			right = mid - 1
+		} else if rf.log[mid].Term < term {
+			left = mid + 1
+		} else {
+			result = mid
+			left = mid + 1
+		}
+	}
+	return result + 1
 }
 
 /**
