@@ -562,29 +562,24 @@ func (rf *Raft) appendLog() {
 			if reply.Success {
 				rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 				rf.nextIndex[server] = rf.matchIndex[server] + 1
+			} else if reply.LogLength < args.PrevLogIndex {
+				// follower的prevLogIndex位置没有日志, 直接从follower的日志下一个位置开始复制
+				rf.nextIndex[server] = reply.LogLength + 1
+			} else if lastIndex := rf.lastIndex(0, args.PrevLogIndex-1, reply.ConflictTerm); lastIndex != 0 {
+				/*
+					如果leader.log找到了Term为conflictTerm的日志，则下一次从leader.log中conflictTerm的
+					最后一个日志的下一个位置开始同步日志
+				*/
+				rf.nextIndex[server] = lastIndex + 1
 			} else {
-				if reply.LogLength < args.PrevLogIndex {
-					// follower的prevLogIndex位置没有日志, 直接从follower的日志下一个位置开始复制
-					rf.nextIndex[server] = reply.LogLength + 1
-				} else {
-					lastIndex := rf.lastIndex(0, args.PrevLogIndex-1, reply.ConflictTerm)
-					if lastIndex != 0 {
-						/*
-							如果leader.log找到了Term为conflictTerm的日志，则下一次从leader.log中conflictTerm的
-							最后一个日志的下一个位置开始同步日志
-						*/
-						rf.nextIndex[server] = lastIndex + 1
-					} else {
-						/*
-							如果leader.log找不到Term为conflictTerm的日志，则下一次从follower.log中conflictTerm的
-							第一个entry的位置开始同步日志;
-							此时需要把leader的日志同步给follower, 而follower任期reply.ConflictTerm的日志leader甚至没有, 所以
-							需要把follower任期reply.ConflictTerm的日志全部覆盖, 所以从follower任期reply.ConflictTerm的第一条
-							日志开始复制
-						*/
-						rf.nextIndex[server] = reply.ConflictTermFirstIndex
-					}
-				}
+				/*
+					如果leader.log找不到Term为conflictTerm的日志，则下一次从follower.log中conflictTerm的
+					第一个entry的位置开始同步日志;
+					此时需要把leader的日志同步给follower, 而follower任期reply.ConflictTerm的日志leader甚至没有, 所以
+					需要把follower任期reply.ConflictTerm的日志全部覆盖, 所以从follower任期reply.ConflictTerm的第一条
+					日志开始复制
+				*/
+				rf.nextIndex[server] = reply.ConflictTermFirstIndex
 			}
 		}(i)
 	}
