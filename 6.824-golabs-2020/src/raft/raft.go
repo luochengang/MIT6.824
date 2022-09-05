@@ -280,7 +280,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.role == Leader {
 			fmt.Printf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, args.Term)
 		}
-		rf.convertToFollower(args.Term, -1)
+		// If election timeout elapses without receiving AppendEntries
+		// RPC from current leader or granting vote to candidate:
+		// convert to candidate
+		// 这里不重置选举超时时间, 因为还没有给candidate投票
+		rf.currentTerm = args.Term
+		rf.role = Follower
+		rf.votedFor = -1
+		rf.persist()
 	}
 
 	/*
@@ -298,6 +305,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				getLastLogTerm(rf.log), args.CandidateId, args.LastLogTerm)
 			fmt.Printf("####此时Server%d的日志为%+v\n", rf.me, rf.log)
 		*/
+		// // 给candidate投票, 重置选举超时时间
 		rf.convertToFollower(args.Term, args.CandidateId)
 		reply.VoteGranted = true
 	}
@@ -326,7 +334,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.convertToFollower(args.Term, args.LeaderId)
 	//fmt.Printf("####Server%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 
-	preLogLen := len(rf.log)
 	if args.PrevLogIndex != 0 && (args.PrevLogIndex > len(rf.log) || rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
 		reply.LogLength = len(rf.log)
 		if args.PrevLogIndex <= len(rf.log) {
@@ -350,23 +357,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				fmt.Printf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
 			}
 	*/
-	// 这里需要考虑RPC响应失败后, 收到相同RPC的情况, 不过这里是幂等的
-	/*
-		复制log到Follower
-		Figure7: 对于Follower c和d，如果收到了leader发送的AppendEntries RPC，会把leader没有的那部分日志删除;
-		如果Leader向Follower发送了第一个AppendEntries RPC，然后Leader在日志中新增了一个条目，然后Leader向Follower发送了
-		第二个AppendEntries RPC，但是第二个RPC比第一个先到。那么Follower收到第一个RPC时，需要把已经添加到日志中的条目给删除
-	*/
-	// 3. If an existing entry conflicts with a new one (same index
-	// but different terms), delete the existing entry and all that
-	// follow it (§5.3)
-	//fmt.Printf("####Server%d任期%d的日志长度由%d变更为%d\n", rf.me, rf.currentTerm, preLogLen, len(rf.log))
-	rf.log = rf.log[:args.PrevLogIndex+idx]
-	rf.log = append(rf.log, args.Entries...)
-	if len(args.Entries) > 0 || preLogLen != len(rf.log) {
+	// 注意Figure8, 这里只在leader有新的日志条目发送给follower时发生覆盖
+	if len(args.Entries) > 0 {
+		// 这里需要考虑RPC响应失败后, 收到相同RPC的情况, 不过这里是幂等的
+		/*
+			复制log到Follower
+			Figure7: 对于Follower c和d，如果收到了leader发送的AppendEntries RPC，不会把leader没有的那部分日志删除;
+			如果Leader向Follower发送了第一个AppendEntries RPC，然后Leader在日志中新增了一个条目，然后Leader向Follower发送了
+			第二个AppendEntries RPC，但是第二个RPC比第一个先到。那么Follower收到第一个RPC时，不需要把已经添加到日志中的条目删除
+		*/
+		// 3. If an existing entry conflicts with a new one (same index
+		// but different terms), delete the existing entry and all that
+		// follow it (§5.3)
+		//fmt.Printf("####Server%d任期%d的日志长度由%d变更为%d\n", rf.me, rf.currentTerm, preLogLen, len(rf.log))
+		rf.log = rf.log[:args.PrevLogIndex+idx]
+		// 4. Append any new entries not already in the log
+		rf.log = append(rf.log, args.Entries...)
 		/*
 			只在日志匹配并且发生变化时持久化, 心跳时不需要持久化
-			这里可能args.Entries长度为0也需要持久化, 比如Figure7的c和d
 		*/
 		rf.persist()
 	}
@@ -523,6 +531,8 @@ func (rf *Raft) appendLog() {
 			if prevLogIndex >= 1 {
 				prevLogTerm = rf.log[prevLogIndex-1].Term
 			}
+			// If last log index ≥ nextIndex for a follower: send
+			// AppendEntries RPC with log entries starting at nextIndex
 			entries := make([]Log, len(rf.log)-rf.nextIndex[server]+1)
 			for j := range entries {
 				entries[j] = rf.log[rf.nextIndex[server]-1+j]
@@ -560,8 +570,15 @@ func (rf *Raft) appendLog() {
 
 			// 这里不需要统计是否半数以上服务器返回了成功
 			if reply.Success {
+				// If successful: update nextIndex and matchIndex for follower (§5.3)
 				rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 				rf.nextIndex[server] = rf.matchIndex[server] + 1
+			} else if reply.LogLength == -1 {
+				/*
+					此时follower.currentTerm > term, 所以reply.LogLength=-1
+					但是后面term可能在收到这个响应之前变大了并且重新当选leader, 导致term >= follower.currentTerm
+				*/
+				return
 			} else if reply.LogLength < args.PrevLogIndex {
 				// follower的prevLogIndex位置没有日志, 直接从follower的日志下一个位置开始复制
 				rf.nextIndex[server] = reply.LogLength + 1
@@ -627,6 +644,9 @@ func (rf *Raft) updateLeaderCommitIndex() {
 		//fmt.Printf("####Server%d任期%d的nextIndex是%d\n", idx, rf.currentTerm, rf.nextIndex[idx])
 	}
 
+	// If there exists an N such that N > commitIndex, a majority
+	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+	// set commitIndex = N (§5.3, §5.4).
 	maxCommitIdx := len(rf.log)
 	for maxCommitIdx > 0 {
 		replicaCnt := 0
@@ -787,6 +807,8 @@ func (rf *Raft) startElection() {
 func (rf *Raft) checkElectLoop() {
 	for !rf.killed() {
 		rf.mu.Lock()
+		// If election timeout elapses: start new election
+		// 这里即使是Candidate状态下超时, 也要开始新的选举
 		if rf.role != Leader && rf.expired() {
 			go rf.startElection()
 		}
@@ -842,8 +864,8 @@ func (rf *Raft) applyCommittedEntries() {
 		for rf.commitIndex <= rf.lastApplied {
 			rf.cond.Wait()
 		}
-
 		rf.mu.Unlock()
+
 		for {
 			rf.mu.Lock()
 			if rf.commitIndex <= rf.lastApplied {
@@ -866,7 +888,6 @@ func (rf *Raft) applyCommittedEntries() {
 			rf.lastApplied++
 			rf.mu.Unlock()
 		}
-
 	}
 }
 
