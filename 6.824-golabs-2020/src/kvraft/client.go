@@ -1,12 +1,17 @@
 package kvraft
 
-import "../labrpc"
+import (
+	"../labrpc"
+	"sync"
+)
 import "crypto/rand"
 import "math/big"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu       sync.Mutex // Lock to protect shared access to this Clerk's state
+	leaderId int        // leaderId that Clerk thinks
 }
 
 func nrand() int64 {
@@ -38,7 +43,21 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{Key: key}
+	reply := GetReply{}
+
+	for {
+		ck.mu.Lock()
+		idx := ck.leaderId
+		ck.mu.Unlock()
+		ok := ck.servers[idx].Call("KVServer.Get", &args, &reply)
+		if ok && reply.Err == "OK" {
+			return reply.Value
+		}
+		ck.mu.Lock()
+		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		ck.mu.Unlock()
+	}
 }
 
 //
@@ -51,8 +70,24 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 //
+// args和 reply的类型（包括它们是否是指针）必须与RPC处理函数参数的声明类型匹配。并且回复必须作为指针传递
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{Key: key, Value: value, Op: op}
+	reply := PutAppendReply{}
+
+	for {
+		ck.mu.Lock()
+		idx := ck.leaderId
+		ck.mu.Unlock()
+		ok := ck.servers[idx].Call("KVServer.PutAppend", &args, &reply)
+		if ok && reply.Err == "OK" {
+			break
+		}
+		ck.mu.Lock()
+		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		ck.mu.Unlock()
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

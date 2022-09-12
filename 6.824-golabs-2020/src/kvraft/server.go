@@ -18,10 +18,22 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type Result int
+
+const (
+	Fail Result = iota
+	Success
+)
+
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+
+	Key          string
+	Value        string
+	OpType       string // "Put", "Append" or "Get"
+	ExecutionRes chan Result
 }
 
 type KVServer struct {
@@ -34,14 +46,51 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	db map[string]string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{OpType: "Get", ExecutionRes: make(chan Result)}
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	<-op.ExecutionRes
+	reply.Err = OK
+
+	kv.mu.Lock()
+	reply.Value = kv.db[args.Key]
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{Key: args.Key, Value: args.Value, OpType: args.Op, ExecutionRes: make(chan Result)}
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	<-op.ExecutionRes
+	reply.Err = OK
+}
+
+func (kv *KVServer) executeCommand() {
+	for applyMsg := range kv.applyCh {
+		command := applyMsg.Command
+		op := command.(Op)
+		kv.mu.Lock()
+		switch op.OpType {
+		case "Append":
+			kv.db[op.Key] += op.Value
+		case "Put":
+			kv.db[op.Key] = op.Value
+		}
+		kv.mu.Unlock()
+		op.ExecutionRes <- Success
+	}
 }
 
 //
@@ -65,7 +114,7 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-//
+// StartKVServer
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -79,6 +128,16 @@ func (kv *KVServer) killed() bool {
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
 //
+/**
+ * @Description:k/v 服务器应该通过底层的 Raft 实现来存储快照，它应该调用 persister.SaveStateAndSnapshot() 来
+ * 原子地保存 Raft 状态和快照。当 Raft 的保存状态超过 maxraftstate 字节时，k/v 服务器应该进行快照，以允许 Raft 对其日志进行
+ * 垃圾收集。如果 maxraftstate 为 -1，则不需要快照。 StartKVServer() 必须快速返回，因此它应该为任何长时间运行的工作启动 goroutine。
+ * @param servers
+ * @param me
+ * @param persister
+ * @param maxraftstate
+ * @return *KVServer
+ */
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
@@ -94,6 +153,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.db = make(map[string]string)
+	go kv.executeCommand()
 
 	return kv
 }
