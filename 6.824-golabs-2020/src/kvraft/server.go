@@ -40,8 +40,8 @@ type KVServer struct {
 	mu      sync.Mutex
 	me      int
 	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	applyCh chan raft.ApplyMsg // 这里的applyCh和raft.applyCh相同
+	dead    int32              // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
 
