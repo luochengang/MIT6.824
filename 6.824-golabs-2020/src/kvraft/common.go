@@ -16,6 +16,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClientId    int // client invoking request (6.3)
+	SequenceNum int // to eliminate duplicates ($6.4)
 }
 
 type PutAppendReply struct {

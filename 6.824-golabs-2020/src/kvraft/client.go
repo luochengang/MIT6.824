@@ -10,8 +10,10 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	mu       sync.Mutex // Lock to protect shared access to this Clerk's state
-	leaderId int        // leaderId that Clerk thinks
+	mu          sync.Mutex // Lock to protect shared access to this Clerk's state
+	leaderId    int        // leaderId that Clerk thinks
+	clientId    int        // client invoking request (6.3)
+	sequenceNum int        // to eliminate duplicates ($6.4)
 }
 
 func nrand() int64 {
@@ -25,6 +27,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = int(nrand())
 	return ck
 }
 
@@ -73,7 +76,10 @@ func (ck *Clerk) Get(key string) string {
 // args和 reply的类型（包括它们是否是指针）必须与RPC处理函数参数的声明类型匹配。并且回复必须作为指针传递
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	args := PutAppendArgs{Key: key, Value: value, Op: op}
+	ck.mu.Lock()
+	ck.sequenceNum++
+	args := PutAppendArgs{Key: key, Value: value, Op: op, ClientId: ck.clientId, SequenceNum: ck.sequenceNum}
+	ck.mu.Unlock()
 	reply := PutAppendReply{}
 
 	for {

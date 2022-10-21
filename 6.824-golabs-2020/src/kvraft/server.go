@@ -30,10 +30,12 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 
-	Key          string
-	Value        string
-	OpType       string // "Put", "Append" or "Get"
-	ExecutionRes chan Result
+	Key         string
+	Value       string
+	OpType      string // "Put", "Append" or "Get"
+	ExeResult   chan Result
+	ClientId    int // client invoking request (6.3)
+	SequenceNum int // to eliminate duplicates ($6.4)
 }
 
 type KVServer struct {
@@ -46,18 +48,24 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	db map[string]string
+	db             map[string]string
+	maxSequenceNum map[int]int // 记录ClientId已执行命令的最大SequenceNum, 防止命令重复执行
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	op := Op{OpType: "Get", ExecutionRes: make(chan Result)}
+	/*
+		Second, a leader must check whether it has been deposed before processing a read-only request (its
+		information may be stale if a more recent leader has been elected). Raft handles this by having the leader
+		exchange heartbeat messages with a majority of the cluster before responding to read-only requests.
+	*/
+	op := Op{OpType: "Get", ExeResult: make(chan Result, 1)}
 	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	<-op.ExecutionRes
+	<-op.ExeResult
 	reply.Err = OK
 
 	kv.mu.Lock()
@@ -67,29 +75,46 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	op := Op{Key: args.Key, Value: args.Value, OpType: args.Op, ExecutionRes: make(chan Result)}
+	op := Op{Key: args.Key, Value: args.Value, OpType: args.Op, ExeResult: make(chan Result, 1),
+		ClientId: args.ClientId, SequenceNum: args.SequenceNum}
 	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	<-op.ExecutionRes
+	<-op.ExeResult
 	reply.Err = OK
 }
 
 func (kv *KVServer) executeCommand() {
+	/*
+		applyCh是tester或service期望Raft发送ApplyMsg消息的通道
+		当每个Raftpeer意识到日志条目被提交时，peer应该通过传递给Make()的applyCh向同一服务器上的service（或tester）发送ApplyMsg
+		applyCh中的附加日志已经处于committed状态, 需要在server中执行该附加日志中的指令
+	*/
 	for applyMsg := range kv.applyCh {
 		command := applyMsg.Command
 		op := command.(Op)
 		kv.mu.Lock()
 		switch op.OpType {
 		case "Append":
+			// 如果已经执行过, 那么不重复执行
+			if kv.maxSequenceNum[op.ClientId] >= op.SequenceNum {
+				break
+			}
 			kv.db[op.Key] += op.Value
+			kv.maxSequenceNum[op.ClientId] = op.SequenceNum
 		case "Put":
+			// 如果已经执行过, 那么不重复执行
+			if kv.maxSequenceNum[op.ClientId] >= op.SequenceNum {
+				break
+			}
 			kv.db[op.Key] = op.Value
+			kv.maxSequenceNum[op.ClientId] = op.SequenceNum
+		default:
 		}
 		kv.mu.Unlock()
-		op.ExecutionRes <- Success
+		op.ExeResult <- Success
 	}
 }
 
@@ -154,6 +179,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.db = make(map[string]string)
+	kv.maxSequenceNum = make(map[int]int)
 	go kv.executeCommand()
 
 	return kv
