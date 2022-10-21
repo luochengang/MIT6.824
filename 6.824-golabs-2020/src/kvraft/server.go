@@ -94,7 +94,11 @@ func (kv *KVServer) executeCommand() {
 	*/
 	for applyMsg := range kv.applyCh {
 		command := applyMsg.Command
+		if command == nil {
+			continue
+		}
 		op := command.(Op)
+
 		kv.mu.Lock()
 		switch op.OpType {
 		case "Append":
@@ -114,6 +118,10 @@ func (kv *KVServer) executeCommand() {
 		default:
 		}
 		kv.mu.Unlock()
+		/*
+			TODO
+			注意这里一条命令只能通知一次
+		*/
 		op.ExeResult <- Success
 	}
 }

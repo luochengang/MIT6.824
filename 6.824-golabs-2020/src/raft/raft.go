@@ -595,6 +595,16 @@ func (rf *Raft) becomeLeader() {
 	rf.mu.Lock()
 	rf.role = Leader
 
+	/*
+		Lab3 Part A
+		First, a leader must have the latest information on which entries are committed. The Leader Completeness Property
+		guarantees that a leader has all committed entries, but at the start of its term, it may not know which those are.
+		To find out, it needs to commit an entry from its term. Raft handles this by having each leader commit a blank
+		no-op entry into the log at the start of its term.
+	*/
+	rf.log = append(rf.log, Log{Term: rf.currentTerm})
+	rf.persist()
+
 	rf.nextIndex = nil
 	rf.matchIndex = nil
 	for i := 0; i < len(rf.peers); i++ {
