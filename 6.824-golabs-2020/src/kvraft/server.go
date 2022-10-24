@@ -62,6 +62,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	*/
 	op := Op{Key: args.Key, OpType: "Get", ExeResult: make(chan Result, 1), ClientId: args.ClientId,
 		SequenceNum: args.SequenceNum}
+	/*
+		无法保证此命令将永远提交到Raft日志，因为leader可能会出故障或在选举中失败
+		第一个返回值是该命令将出现的索引，如果它曾经被提交的话
+		这里可能需要检查index和term是否一致
+	*/
 	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
