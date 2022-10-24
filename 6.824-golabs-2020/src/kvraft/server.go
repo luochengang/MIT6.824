@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -55,11 +55,13 @@ type KVServer struct {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	/*
-		Second, a leader must check whether it has been deposed before processing a read-only request (its
-		information may be stale if a more recent leader has been elected). Raft handles this by having the leader
-		exchange heartbeat messages with a majority of the cluster before responding to read-only requests.
+			Second, a leader must check whether it has been deposed before processing a read-only request (its
+			information may be stale if a more recent leader has been elected). Raft handles this by having the leader
+			exchange heartbeat messages with a majority of the cluster before responding to read-only requests.
+		这里的Get类型命令需要通道ExeResult是因为这里需要知道该命令是否已经被commit
 	*/
-	op := Op{OpType: "Get", ExeResult: make(chan Result, 1)}
+	op := Op{Key: args.Key, OpType: "Get", ExeResult: make(chan Result, 1), ClientId: args.ClientId,
+		SequenceNum: args.SequenceNum}
 	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -115,14 +117,24 @@ func (kv *KVServer) executeCommand() {
 			}
 			kv.db[op.Key] = op.Value
 			kv.maxSequenceNum[op.ClientId] = op.SequenceNum
+		case "Get":
+			// 如果已经执行过, 那么不重复执行 这里需不需要这样存疑
+			if kv.maxSequenceNum[op.ClientId] >= op.SequenceNum {
+				break
+			}
+			kv.maxSequenceNum[op.ClientId] = op.SequenceNum
 		default:
+			// 不需要有default
 		}
 		kv.mu.Unlock()
 		/*
-			TODO
-			注意这里一条命令只能通知一次
+			对于相同ClientId和SequenceNum的Append/Put命令, 只有一条命令的通道会收到Success消息, 其它的都会阻塞在
+			<-op.ExeResult
+			假设命令已经被执行, 但是由于网络延迟, 导致响应RPC没有及时到达, Client会重发请求, 这时已经不再需要重复执行命令,
+			但是仍旧需要向ExeResult通道发送Success消息, 否则会导致Get/PutAppend阻塞
 		*/
 		op.ExeResult <- Success
+		close(op.ExeResult)
 	}
 }
 

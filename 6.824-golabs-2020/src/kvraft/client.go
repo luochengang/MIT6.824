@@ -46,12 +46,16 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	args := GetArgs{Key: key}
+	ck.mu.Lock()
+	ck.sequenceNum++
+	args := GetArgs{Key: key, ClientId: ck.clientId, SequenceNum: ck.sequenceNum}
+	ck.mu.Unlock()
 	reply := GetReply{}
 
 	for {
 		ck.mu.Lock()
 		idx := ck.leaderId
+		DPrintf("####client%d发出Get命令, key为%s\n", ck.clientId, key)
 		ck.mu.Unlock()
 		ok := ck.servers[idx].Call("KVServer.Get", &args, &reply)
 		if ok && reply.Err == "OK" {
@@ -85,6 +89,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for {
 		ck.mu.Lock()
 		idx := ck.leaderId
+		DPrintf("####client%d发出PutAppend命令, key为%s, value为%s\n", ck.clientId, key, value)
 		ck.mu.Unlock()
 		ok := ck.servers[idx].Call("KVServer.PutAppend", &args, &reply)
 		if ok && reply.Err == "OK" {

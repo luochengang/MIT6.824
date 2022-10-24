@@ -27,6 +27,9 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	// Get请求也需要保证只被执行一次
+	ClientId    int // client invoking request (6.3)
+	SequenceNum int // to eliminate duplicates ($6.4)
 }
 
 type GetReply struct {
