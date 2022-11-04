@@ -7,9 +7,10 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -33,9 +34,8 @@ type Op struct {
 	Key         string
 	Value       string
 	OpType      string // "Put", "Append" or "Get"
-	ExeResult   chan Result
-	ClientId    int // client invoking request (6.3)
-	SequenceNum int // to eliminate duplicates ($6.4)
+	ClientId    int    // client invoking request (6.3)
+	SequenceNum int    // to eliminate duplicates ($6.4)
 }
 
 type KVServer struct {
@@ -50,6 +50,38 @@ type KVServer struct {
 	// Your definitions here.
 	db             map[string]string
 	maxSequenceNum map[int]int // 记录ClientId已执行命令的最大SequenceNum, 防止命令重复执行
+	indexToCh      sync.Map    // 日志索引index -> Op通道
+}
+
+func (kv *KVServer) start(comand Op) (isLeader bool) {
+	index, _, isLeader := kv.rf.Start(comand)
+	// rf.Start()会立即返回. 如果rf不是leader, 直接返回false
+	if !isLeader {
+		return false
+	}
+
+	val, ok := kv.indexToCh.Load(index)
+	if !ok {
+		/*
+			如果index对应的通道不存在, 则新建通道
+			这里选择缓冲通道/无缓冲通道对读取没有差别, 但是对写有差别. 选择缓冲通道的好处是, 写完以后不用等读取就可以继续执行
+		*/
+		kv.indexToCh.Store(index, make(chan Op, 1))
+		val, _ = kv.indexToCh.Load(index)
+	}
+	ch := val.(chan Op)
+	select {
+	case op := <-ch:
+		// 如果索引为index处对应的Op通道内命令的ClientId和SequenceNum与Client调用RPC时的不相同, 那么说明rf已经不是leader
+		if op.ClientId != comand.ClientId || op.SequenceNum != comand.SequenceNum {
+			return false
+		}
+		// 只在命令被成功执行以后才删除index对应的Op通道
+		kv.indexToCh.Delete(index)
+	case <-time.After(800 * time.Millisecond):
+		return false
+	}
+	return true
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -60,19 +92,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			exchange heartbeat messages with a majority of the cluster before responding to read-only requests.
 		这里的Get类型命令需要通道ExeResult是因为这里需要知道该命令是否已经被commit
 	*/
-	op := Op{Key: args.Key, OpType: "Get", ExeResult: make(chan Result, 1), ClientId: args.ClientId,
-		SequenceNum: args.SequenceNum}
+	op := Op{Key: args.Key, OpType: "Get", ClientId: args.ClientId, SequenceNum: args.SequenceNum}
 	/*
 		无法保证此命令将永远提交到Raft日志，因为leader可能会出故障或在选举中失败
 		第一个返回值是该命令将出现的索引，如果它曾经被提交的话
 		这里可能需要检查index和term是否一致
 	*/
-	_, _, isLeader := kv.rf.Start(op)
+	isLeader := kv.start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	<-op.ExeResult
 	reply.Err = OK
 
 	kv.mu.Lock()
@@ -82,14 +112,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	op := Op{Key: args.Key, Value: args.Value, OpType: args.Op, ExeResult: make(chan Result, 1),
-		ClientId: args.ClientId, SequenceNum: args.SequenceNum}
-	_, _, isLeader := kv.rf.Start(op)
+	op := Op{Key: args.Key, Value: args.Value, OpType: args.Op, ClientId: args.ClientId, SequenceNum: args.SequenceNum}
+	isLeader := kv.start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	<-op.ExeResult
 	reply.Err = OK
 }
 
@@ -133,13 +161,23 @@ func (kv *KVServer) executeCommand() {
 		}
 		kv.mu.Unlock()
 		/*
-			对于相同ClientId和SequenceNum的Append/Put命令, 只有一条命令的通道会收到Success消息, 其它的都会阻塞在
-			<-op.ExeResult
+			对于相同ClientId和SequenceNum的Append/Put命令, 可能会有多个通道吗
 			假设命令已经被执行, 但是由于网络延迟, 导致响应RPC没有及时到达, Client会重发请求, 这时已经不再需要重复执行命令,
-			但是仍旧需要向ExeResult通道发送Success消息, 否则会导致Get/PutAppend阻塞
+			但是仍旧需要向通道发送Success消息, 否则会导致Get/PutAppend阻塞
 		*/
-		op.ExeResult <- Success
-		close(op.ExeResult)
+		val, ok := kv.indexToCh.Load(applyMsg.CommandIndex)
+		if !ok {
+			/*
+					如果index对应的通道不存在, 则新建通道
+					这里选择缓冲通道/无缓冲通道对读取没有差别, 但是对写有差别. 选择缓冲通道的好处是, 写完以后不用等读取就可以继续执行
+				    同一条命令可能会在日志里存储两次, 于是会有两个索引, 这两个索引对应的通道都需要发送消息
+			*/
+			kv.indexToCh.Store(applyMsg.CommandIndex, make(chan Op, 1))
+			val, _ = kv.indexToCh.Load(applyMsg.CommandIndex)
+		}
+		ch := val.(chan Op)
+		ch <- op
+		close(ch)
 	}
 }
 
