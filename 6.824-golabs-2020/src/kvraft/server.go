@@ -72,12 +72,12 @@ func (kv *KVServer) start(comand Op) (isLeader bool) {
 	ch := val.(chan Op)
 	select {
 	case op := <-ch:
+		// index对应的Op通道只用一次
+		kv.indexToCh.Delete(index)
 		// 如果索引为index处对应的Op通道内命令的ClientId和SequenceNum与Client调用RPC时的不相同, 那么说明rf已经不是leader
 		if op.ClientId != comand.ClientId || op.SequenceNum != comand.SequenceNum {
 			return false
 		}
-		// 只在命令被成功执行以后才删除index对应的Op通道
-		kv.indexToCh.Delete(index)
 	case <-time.After(800 * time.Millisecond):
 		return false
 	}
