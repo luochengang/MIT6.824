@@ -725,7 +725,8 @@ func (rf *Raft) startElection() {
 	rf.resetTimeout()
 	rf.persist()
 
-	countVote := 1
+	trueVote := 1
+	falseVote := 0
 	done := false
 	// 如果只有1台服务器
 	if len(rf.peers) == 1 {
@@ -738,6 +739,10 @@ func (rf *Raft) startElection() {
 	rf.mu.Unlock()
 
 	for i := range rf.peers {
+		// 如果已经有半数或者以上投了反对票, 那么已经不可能成为leader
+		if falseVote >= (len(rf.peers)+1)/2 {
+			break
+		}
 		// 不用给自己发
 		if i == rf.me {
 			continue
@@ -779,10 +784,12 @@ func (rf *Raft) startElection() {
 			}
 			if reply.VoteGranted {
 				FPrintf("####Server%d任期%d投票给Candidate%d任期%d\n", server, reply.Term, rf.me, rf.currentTerm)
-				countVote++
+				trueVote++
+			} else {
+				falseVote++
 			}
 
-			if done || countVote <= len(rf.peers)/2 {
+			if done || trueVote <= len(rf.peers)/2 {
 				rf.mu.Unlock()
 				return
 			}
