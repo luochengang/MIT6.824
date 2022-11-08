@@ -121,6 +121,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.Err = OK
 }
 
+func (kv *KVServer) snapshot() {
+	if kv.maxraftstate != -1 && kv.rf.RaftStateSize() > kv.maxraftstate {
+
+	}
+}
+
 func (kv *KVServer) executeCommand() {
 	/*
 		applyCh是tester或service期望Raft发送ApplyMsg消息的通道

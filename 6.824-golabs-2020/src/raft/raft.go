@@ -896,6 +896,26 @@ func (rf *Raft) applyCommittedEntries() {
 	}
 }
 
+// Snapshot
+/**
+ * @Description
+ * @Param
+ * @return
+ **/
+func (rf *Raft) Snapshot() {
+
+}
+
+// RaftStateSize
+/**
+ * @Description 返回当前raft持久化状态的大小
+ * @Param
+ * @return
+ **/
+func (rf *Raft) RaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
