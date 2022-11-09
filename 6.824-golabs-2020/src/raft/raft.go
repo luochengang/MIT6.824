@@ -45,6 +45,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	Term         int
 }
 
 type Log struct {
@@ -107,6 +108,10 @@ type Raft struct {
 	electTimeout time.Time  // 选举超时时间
 	cond         *sync.Cond // Leader收到新Log时将激活该条件变量
 	applyCh      chan ApplyMsg
+
+	// 用于日志压缩
+	lastIncludedIndex int // the snapshot replaces all entries up through and including this index
+	lastIncludedTerm  int // term of lastIncludedIndex
 }
 
 // return currentTerm and whether this server
@@ -885,7 +890,8 @@ func (rf *Raft) applyCommittedEntries() {
 			// log[lastApplied] to state machine (§5.3)
 			applyMsg := ApplyMsg{CommandValid: true,
 				Command:      rf.log[rf.lastApplied].Command,
-				CommandIndex: rf.lastApplied + 1}
+				CommandIndex: rf.lastApplied + 1,
+				Term:         rf.log[rf.lastApplied].Term}
 			rf.mu.Unlock()
 			rf.applyCh <- applyMsg
 			rf.mu.Lock()
@@ -896,22 +902,38 @@ func (rf *Raft) applyCommittedEntries() {
 	}
 }
 
+//
 // Snapshot
-/**
- * @Description
- * @Param
- * @return
- **/
-func (rf *Raft) Snapshot() {
+//  @Description:
+//  @receiver rf
+//  @param data
+//
+func (rf *Raft) Snapshot(data []byte) {
+	// TODO
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var lastIncludedIndex, lastIncludedTerm int
+	if d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
+		DPrintf("####decode error\n")
+		return
+	}
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
+	rf.log = rf.log[rf.lastIncludedIndex:]
 }
 
+//
 // RaftStateSize
-/**
- * @Description 返回当前raft持久化状态的大小
- * @Param
- * @return
- **/
+//  @Description: 返回当前raft持久化状态的大小
+//  @receiver rf
+//  @return int 当前raft持久化状态的大小
+//
 func (rf *Raft) RaftStateSize() int {
 	return rf.persister.RaftStateSize()
 }

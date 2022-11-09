@@ -4,6 +4,8 @@ import (
 	"../labgob"
 	"../labrpc"
 	"../raft"
+	"bytes"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -51,6 +53,10 @@ type KVServer struct {
 	db             map[string]string
 	maxSequenceNum map[int]int // 记录ClientId已执行命令的最大SequenceNum, 防止命令重复执行
 	indexToCh      sync.Map    // 日志索引index -> Op通道
+
+	// 用于日志压缩
+	lastIncludedIndex int // the snapshot replaces all entries up through and including this index
+	lastIncludedTerm  int // term of lastIncludedIndex
 }
 
 func (kv *KVServer) start(comand Op) (isLeader bool) {
@@ -121,9 +127,68 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.Err = OK
 }
 
-func (kv *KVServer) snapshot() {
-	if kv.maxraftstate != -1 && kv.rf.RaftStateSize() > kv.maxraftstate {
+//
+// snapshot
+//  @Description: 进行快照, 调用时不允许持有锁
+//  @receiver kv
+//  @return []byte 快照
+//
+func (kv *KVServer) snapshot() []byte {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	err := e.Encode(kv.maxraftstate)
+	if err != nil {
+		DPrintf("####Service%d快照时编码失败\n", kv.me)
+	}
+	err = e.Encode(kv.db)
+	if err != nil {
+		DPrintf("####Service%d快照时编码失败\n", kv.me)
+	}
+	err = e.Encode(kv.maxSequenceNum)
+	if err != nil {
+		DPrintf("####Service%d快照时编码失败\n", kv.me)
+	}
+	err = e.Encode(kv.lastIncludedIndex)
+	if err != nil {
+		DPrintf("####Service%d快照时编码失败\n", kv.me)
+	}
+	err = e.Encode(kv.lastIncludedTerm)
+	if err != nil {
+		DPrintf("####Service%d快照时编码失败\n", kv.me)
+	}
+	data := w.Bytes()
+	return data
+}
 
+//
+// installSnapshot
+//  @Description: 安装快照, 调用时不允许持有锁
+//  @receiver kv
+//  @param data 快照
+//
+func (kv *KVServer) installSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var maxraftstate, lastIncludedIndex, lastIncludedTerm int
+	var db map[string]string
+	var maxSequenceNum map[int]int
+	if d.Decode(&maxraftstate) != nil || d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil ||
+		d.Decode(&db) != nil || d.Decode(&maxSequenceNum) != nil {
+		DPrintf("####decode error\n")
+	} else {
+		kv.maxraftstate = maxraftstate
+		kv.lastIncludedIndex = lastIncludedIndex
+		kv.lastIncludedTerm = lastIncludedTerm
+		kv.db = db
+		kv.maxSequenceNum = maxSequenceNum
 	}
 }
 
@@ -134,6 +199,13 @@ func (kv *KVServer) executeCommand() {
 		applyCh中的附加日志已经处于committed状态, 需要在server中执行该附加日志中的指令
 	*/
 	for applyMsg := range kv.applyCh {
+		// 如果是快照
+		if !applyMsg.CommandValid {
+			snapshot := applyMsg.Command.([]byte)
+			kv.installSnapshot(snapshot)
+			continue
+		}
+
 		command := applyMsg.Command
 		if command == nil {
 			continue
@@ -165,6 +237,8 @@ func (kv *KVServer) executeCommand() {
 		default:
 			// 不需要有default
 		}
+		kv.lastIncludedIndex = applyMsg.CommandIndex
+		kv.lastIncludedTerm = applyMsg.Term
 		kv.mu.Unlock()
 		/*
 			对于相同ClientId和SequenceNum的Append/Put命令, 可能会有多个通道吗
@@ -184,6 +258,16 @@ func (kv *KVServer) executeCommand() {
 		ch := val.(chan Op)
 		ch <- op
 		close(ch)
+
+		/*
+			多久检查一次持久化状态的大小？
+			注意只有达成共识，也就是被提交的日志才可能被快照。所以每次当有新的日志被提交时，就检查一次。如果持久化状态大小大于maxraftstate，则
+			进行快照
+		*/
+		if kv.maxraftstate != -1 && kv.rf.RaftStateSize() > kv.maxraftstate {
+			snapshot := kv.snapshot()
+			kv.rf.Snapshot(snapshot)
+		}
 	}
 }
 
