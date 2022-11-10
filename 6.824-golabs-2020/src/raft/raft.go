@@ -91,6 +91,9 @@ type Raft struct {
 	   by leader (first index is 1)
 	*/
 	log []Log
+	// 用于日志压缩, 也需要持久化
+	lastIncludedIndex int // the snapshot replaces all entries up through and including this index
+	lastIncludedTerm  int // term of lastIncludedIndex
 
 	// Volatile state on all servers
 	commitIndex int // index of highest log entry known to be committed, initialized to 0
@@ -108,10 +111,6 @@ type Raft struct {
 	electTimeout time.Time  // 选举超时时间
 	cond         *sync.Cond // Leader收到新Log时将激活该条件变量
 	applyCh      chan ApplyMsg
-
-	// 用于日志压缩
-	lastIncludedIndex int // the snapshot replaces all entries up through and including this index
-	lastIncludedTerm  int // term of lastIncludedIndex
 }
 
 // return currentTerm and whether this server
@@ -169,8 +168,53 @@ func (rf *Raft) persist() {
 	if err != nil {
 		fmt.Printf("####Server%d编码日志%+v失败\n", rf.me, rf.log)
 	}
+
+	// 持久化快照相关的成员
+	err = e.Encode(rf.lastIncludedIndex)
+	if err != nil {
+		DPrintf("####Server%d编码lastIncludedIndex%d失败\n", rf.me, rf.lastIncludedIndex)
+	}
+	err = e.Encode(rf.lastIncludedTerm)
+	if err != nil {
+		DPrintf("####Server%d编码lastIncludedTerm%d失败\n", rf.me, rf.lastIncludedTerm)
+	}
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
+}
+
+//
+// persistAndSnapshot
+//  @Description: 保存持久状态和快照, 调用时必须持有锁
+//  @receiver rf
+//  @param snapshot
+//
+func (rf *Raft) persistAndSnapshot(snapshot []byte) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	err := e.Encode(rf.currentTerm)
+	if err != nil {
+		fmt.Printf("####Server%d编码任期%d失败\n", rf.me, rf.currentTerm)
+	}
+	err = e.Encode(rf.votedFor)
+	if err != nil {
+		fmt.Printf("####Server%d编码投票%d失败\n", rf.me, rf.votedFor)
+	}
+	err = e.Encode(rf.log)
+	if err != nil {
+		fmt.Printf("####Server%d编码日志%+v失败\n", rf.me, rf.log)
+	}
+
+	// 持久化快照相关的成员
+	err = e.Encode(rf.lastIncludedIndex)
+	if err != nil {
+		DPrintf("####Server%d编码lastIncludedIndex%d失败\n", rf.me, rf.lastIncludedIndex)
+	}
+	err = e.Encode(rf.lastIncludedTerm)
+	if err != nil {
+		DPrintf("####Server%d编码lastIncludedTerm%d失败\n", rf.me, rf.lastIncludedTerm)
+	}
+	data := w.Bytes()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 }
 
 //
@@ -200,13 +244,16 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm, votedFor int
 	var log []Log
-	if d.Decode(&currentTerm) != nil ||
-		d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+	var lastIncludedIndex, lastIncludedTerm int
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil ||
+		d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
 		fmt.Println("####decode error")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 	}
 }
 
@@ -906,17 +953,16 @@ func (rf *Raft) applyCommittedEntries() {
 // Snapshot
 //  @Description:
 //  @receiver rf
-//  @param data
+//  @param snapshot 快照
 //
-func (rf *Raft) Snapshot(data []byte) {
-	// TODO
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+func (rf *Raft) Snapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
 		return
 	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	r := bytes.NewBuffer(data)
+	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	var lastIncludedIndex, lastIncludedTerm int
 	if d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
@@ -925,7 +971,9 @@ func (rf *Raft) Snapshot(data []byte) {
 	}
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
+	// 裁剪日志
 	rf.log = rf.log[rf.lastIncludedIndex:]
+	rf.persistAndSnapshot(snapshot)
 }
 
 /**
@@ -934,6 +982,17 @@ func (rf *Raft) Snapshot(data []byte) {
  */
 func (rf *Raft) getLogLength() int {
 	return rf.lastIncludedIndex + len(rf.log)
+}
+
+//
+// vIndexToA
+//  @Description: 日志的虚拟索引转换为实际索引, 从1开始
+//  @receiver rf
+//  @param index
+//  @return int
+//
+func (rf *Raft) vIndexToA(index int) int {
+	return index - rf.lastIncludedIndex
 }
 
 //
