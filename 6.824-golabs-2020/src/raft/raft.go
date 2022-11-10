@@ -291,8 +291,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2. If votedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
-		(args.LastLogTerm > getLastLogTerm(rf.log) || (args.LastLogTerm == getLastLogTerm(rf.log) &&
-			args.LastLogIndex >= len(rf.log))) {
+		(args.LastLogTerm > rf.getLastLogTerm() || (args.LastLogTerm == rf.getLastLogTerm() &&
+			args.LastLogIndex >= rf.getLogLength())) {
 		/*
 			FPrintf("####Server%d最后日志任期%d给Candidate%d最后日志任期%d投票\n", rf.me,
 				getLastLogTerm(rf.log), args.CandidateId, args.LastLogTerm)
@@ -327,9 +327,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.convertToFollower(args.Term, args.LeaderId)
 	//FPrintf("####Server%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 
-	if args.PrevLogIndex != 0 && (args.PrevLogIndex > len(rf.log) || rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
-		reply.LogLength = len(rf.log)
-		if args.PrevLogIndex <= len(rf.log) {
+	if args.PrevLogIndex != 0 && (args.PrevLogIndex > rf.getLogLength() || rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+		reply.LogLength = rf.getLogLength()
+		if args.PrevLogIndex <= rf.getLogLength() {
 			reply.ConflictTerm = rf.log[args.PrevLogIndex-1].Term
 			reply.ConflictTermFirstIndex = rf.firstIndex(0, args.PrevLogIndex-1, reply.ConflictTerm)
 		}
@@ -339,7 +339,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true
 	idx := 0
-	for args.PrevLogIndex+idx < len(rf.log) && idx < len(args.Entries) &&
+	for args.PrevLogIndex+idx < rf.getLogLength() && idx < len(args.Entries) &&
 		rf.log[args.PrevLogIndex+idx].Term == args.Entries[idx].Term {
 		idx++
 	}
@@ -381,11 +381,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 服务器只在日志和Leader匹配的情况下更新commitIndex
 	// rf.commitIndex可能变小, 然后导致越界错误
-	rf.commitIndex = min(rf.commitIndex, len(rf.log))
+	rf.commitIndex = min(rf.commitIndex, rf.getLogLength())
 	// 5. If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log))
+		rf.commitIndex = min(args.LeaderCommit, rf.getLogLength())
 		FPrintf("####Server%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, rf.commitIndex)
 		// 这里已经用rf.mu.Lock()加锁了, 不需要再用rf.cond.L.Lock()加锁, 否则会导致死锁
 		rf.cond.Signal()
@@ -459,10 +459,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.log = append(rf.log, Log{Command: command, Term: rf.currentTerm})
-	index = len(rf.log)
+	index = rf.getLogLength()
 	term = rf.currentTerm
-	rf.matchIndex[rf.me] = len(rf.log)
-	rf.nextIndex[rf.me] = len(rf.log) + 1
+	rf.matchIndex[rf.me] = rf.getLogLength()
+	rf.nextIndex[rf.me] = rf.getLogLength() + 1
 	rf.persist()
 	rf.mu.Unlock()
 
@@ -492,11 +492,11 @@ func (rf *Raft) killed() bool {
 }
 
 // 调用时必须持有锁
-func getLastLogTerm(log []Log) int {
-	if len(log) == 0 {
-		return 0
+func (rf *Raft) getLastLogTerm() int {
+	if len(rf.log) == 0 {
+		return rf.lastIncludedTerm
 	}
-	return log[len(log)-1].Term
+	return rf.log[len(rf.log)-1].Term
 }
 
 /**
@@ -526,7 +526,7 @@ func (rf *Raft) appendLog() {
 			}
 			// If last log index ≥ nextIndex for a follower: send
 			// AppendEntries RPC with log entries starting at nextIndex
-			entries := make([]Log, len(rf.log)-rf.nextIndex[server]+1)
+			entries := make([]Log, rf.getLogLength()-rf.nextIndex[server]+1)
 			for j := range entries {
 				entries[j] = rf.log[rf.nextIndex[server]-1+j]
 			}
@@ -613,10 +613,10 @@ func (rf *Raft) becomeLeader() {
 	rf.nextIndex = nil
 	rf.matchIndex = nil
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex = append(rf.nextIndex, len(rf.log)+1)
+		rf.nextIndex = append(rf.nextIndex, rf.getLogLength()+1)
 		rf.matchIndex = append(rf.matchIndex, 0)
 	}
-	rf.matchIndex[rf.me] = len(rf.log)
+	rf.matchIndex[rf.me] = rf.getLogLength()
 	rf.mu.Unlock()
 
 	for !rf.killed() {
@@ -650,7 +650,7 @@ func (rf *Raft) updateLeaderCommitIndex() {
 	// If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 	// set commitIndex = N (§5.3, §5.4).
-	maxCommitIdx := len(rf.log)
+	maxCommitIdx := rf.getLogLength()
 	for maxCommitIdx > 0 {
 		replicaCnt := 0
 		for _, v := range rf.matchIndex {
@@ -762,8 +762,8 @@ func (rf *Raft) startElection() {
 
 			args := &RequestVoteArgs{Term: rf.currentTerm,
 				CandidateId:  rf.me,
-				LastLogIndex: len(rf.log),
-				LastLogTerm:  getLastLogTerm(rf.log)}
+				LastLogIndex: rf.getLogLength(),
+				LastLogTerm:  rf.getLastLogTerm()}
 			rf.mu.Unlock()
 
 			reply := &RequestVoteReply{}
@@ -926,6 +926,14 @@ func (rf *Raft) Snapshot(data []byte) {
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
 	rf.log = rf.log[rf.lastIncludedIndex:]
+}
+
+/**
+ * @Description: 返回raft日志长度, 调用时必须持有锁
+ * @return int
+ */
+func (rf *Raft) getLogLength() int {
+	return rf.lastIncludedIndex + len(rf.log)
 }
 
 //
