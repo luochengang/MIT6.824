@@ -302,6 +302,26 @@ type AppendEntriesReply struct {
 }
 
 //
+// InstallSnapshot RPC arguments structure.
+// field names must start with capital letters!
+//
+type InstallSnapshotArgs struct {
+	Term              int    // leader’s term
+	LeaderId          int    // so follower can redirect clients
+	lastIncludedIndex int    // the snapshot replaces all entries up through and including this index
+	lastIncludedTerm  int    // term of lastIncludedIndex
+	data              []byte // raw bytes of the snapshot
+}
+
+//
+// InstallSnapshot RPC reply structure.
+// field names must start with capital letters!
+//
+type InstallSnapshotReply struct {
+	Term int // currentTerm, for leader to update itself
+}
+
+//
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -440,6 +460,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 //
+// InstallSnapshot
+//  @Description: 收到InstallSnapshot RPC的server在这里进行处理
+//  @receiver rf
+//  @param args
+//  @param reply
+//
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
+	// Leader任期 < Follower任期
+	// 1. Reply false if term < currentTerm (§5.1)
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// 这里需要转换成Follower吗
+	// TODO
+
+	rf.extractSnapshot(args.data)
+}
+
+//
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -476,6 +519,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	// 在这里调用了func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply)
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -550,9 +599,6 @@ func (rf *Raft) getLastLogTerm() int {
  * @Description: Leader给其他服务器发送心跳消息
  */
 func (rf *Raft) appendLog() {
-	rf.mu.Lock()
-	//暂时FPrintf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
-	rf.mu.Unlock()
 	for i := range rf.peers {
 		// 不用给自己发心跳
 		if i == rf.me {
@@ -568,9 +614,24 @@ func (rf *Raft) appendLog() {
 
 			prevLogIndex := rf.nextIndex[server] - 1
 			var prevLogTerm int
-			if prevLogIndex >= 1 {
+			if prevLogIndex < rf.lastIncludedIndex {
+				snapshot := rf.persister.ReadSnapshot()
+				args := &InstallSnapshotArgs{Term: rf.currentTerm,
+					LeaderId:          rf.me,
+					lastIncludedIndex: rf.lastIncludedIndex,
+					lastIncludedTerm:  rf.lastIncludedTerm,
+					data:              snapshot}
+				rf.mu.Unlock()
+				reply := &InstallSnapshotReply{}
+				// 这里失败了不需要重发
+				rf.sendInstallSnapshot(server, args, reply)
+				return
+			} else if prevLogIndex == rf.lastIncludedIndex {
+				prevLogTerm = rf.lastIncludedTerm
+			} else if prevLogIndex >= 1 {
 				prevLogTerm = rf.log[prevLogIndex-1].Term
 			}
+
 			// If last log index ≥ nextIndex for a follower: send
 			// AppendEntries RPC with log entries starting at nextIndex
 			entries := make([]Log, rf.getLogLength()-rf.nextIndex[server]+1)
@@ -956,24 +1017,39 @@ func (rf *Raft) applyCommittedEntries() {
 //  @param snapshot 快照
 //
 func (rf *Raft) Snapshot(snapshot []byte) {
-	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	ok := rf.extractSnapshot(snapshot)
+	if !ok {
 		return
 	}
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	// 裁剪日志
+	rf.log = rf.log[rf.lastIncludedIndex:]
+	rf.persistAndSnapshot(snapshot)
+}
+
+//
+// extractSnapshot
+//  @Description: 提取快照中的元数据, 调用时必须持有锁
+//  @receiver rf
+//  @param snapshot 快照
+//  @return bool
+//
+func (rf *Raft) extractSnapshot(snapshot []byte) bool {
+	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
+		return false
+	}
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	var lastIncludedIndex, lastIncludedTerm int
 	if d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
 		DPrintf("####decode error\n")
-		return
+		return false
 	}
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
-	// 裁剪日志
-	rf.log = rf.log[rf.lastIncludedIndex:]
-	rf.persistAndSnapshot(snapshot)
+	return true
 }
 
 /**
