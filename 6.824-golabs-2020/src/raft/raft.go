@@ -1107,6 +1107,11 @@ func (rf *Raft) extractSnapshot(snapshot []byte) {
 
 	// 裁剪日志, 注意裁剪可能发生多次, 所以不能简单地设置成rf.lastIncludedIndex:
 	if rf.lastIncludedIndex+len(rf.log) < lastIncludedIndex {
+		/*
+			Usually the snapshot will contain new information not already in the recipient’s log. In this case, the follower
+			discards its entire log; it is all superseded by the snapshot and may possibly have uncommitted entries that
+			conflict with the snapshot.
+		*/
 		rf.log = nil
 	} else {
 		rf.log = rf.log[lastIncludedIndex-rf.lastIncludedIndex:]
