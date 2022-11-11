@@ -485,7 +485,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 	// Leader任期 < Follower任期
 	// 1. Reply false if term < currentTerm (§5.1)
-	if args.Term < rf.currentTerm || args.LastIncludedIndex <= rf.lastIncludedIndex {
+	if args.Term < rf.currentTerm {
 		return
 	}
 	// 这里需要转换成Follower. 注意一个任期内只会有一个Leader
@@ -1098,11 +1098,13 @@ func (rf *Raft) extractSnapshot(snapshot []byte) {
 		return
 	}
 
-	/*
-		fmt.Printf("####rf.lastIncludedIndex%d#len(rf.log)%d#lastIncludedIndex%d\n", rf.lastIncludedIndex,
-			len(rf.log), lastIncludedIndex)
-		删除
-	*/
+	DPrintf("####rf.lastIncludedIndex%d#len(rf.log)%d#lastIncludedIndex%d\n", rf.lastIncludedIndex,
+		len(rf.log), lastIncludedIndex)
+	// RPC可能存在延迟
+	if lastIncludedIndex <= rf.lastIncludedIndex {
+		return
+	}
+
 	// 裁剪日志, 注意裁剪可能发生多次, 所以不能简单地设置成rf.lastIncludedIndex:
 	if rf.lastIncludedIndex+len(rf.log) < lastIncludedIndex {
 		rf.log = nil
