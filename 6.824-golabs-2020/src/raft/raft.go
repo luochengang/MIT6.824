@@ -136,6 +136,14 @@ func min(a, b int) int {
 	}
 }
 
+func max(a, b int) int {
+	if a < b {
+		return b
+	} else {
+		return a
+	}
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -308,9 +316,9 @@ type AppendEntriesReply struct {
 type InstallSnapshotArgs struct {
 	Term              int    // leader’s term
 	LeaderId          int    // so follower can redirect clients
-	lastIncludedIndex int    // the snapshot replaces all entries up through and including this index
-	lastIncludedTerm  int    // term of lastIncludedIndex
-	data              []byte // raw bytes of the snapshot
+	LastIncludedIndex int    // the snapshot replaces all entries up through and including this index
+	LastIncludedTerm  int    // term of lastIncludedIndex
+	Data              []byte // raw bytes of the snapshot
 }
 
 //
@@ -394,11 +402,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.convertToFollower(args.Term, args.LeaderId)
 	//FPrintf("####Server%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 
-	if args.PrevLogIndex != 0 && (args.PrevLogIndex > rf.getLogLength() || rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		return
+	} else if args.PrevLogIndex == rf.lastIncludedIndex {
+		if args.PrevLogTerm != rf.lastIncludedTerm {
+			return
+		}
+	} else if args.PrevLogIndex != 0 && (args.PrevLogIndex > rf.getLogLength() || rf.log[rf.vIndexToA(args.PrevLogIndex)-1].Term != args.PrevLogTerm) {
 		reply.LogLength = rf.getLogLength()
 		if args.PrevLogIndex <= rf.getLogLength() {
-			reply.ConflictTerm = rf.log[args.PrevLogIndex-1].Term
-			reply.ConflictTermFirstIndex = rf.firstIndex(0, args.PrevLogIndex-1, reply.ConflictTerm)
+			reply.ConflictTerm = rf.log[rf.vIndexToA(args.PrevLogIndex)-1].Term
+			reply.ConflictTermFirstIndex = rf.firstIndex(0, rf.vIndexToA(args.PrevLogIndex)-1, reply.ConflictTerm)
 		}
 		// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 		return
@@ -407,16 +421,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	idx := 0
 	for args.PrevLogIndex+idx < rf.getLogLength() && idx < len(args.Entries) &&
-		rf.log[args.PrevLogIndex+idx].Term == args.Entries[idx].Term {
+		rf.log[rf.vIndexToA(args.PrevLogIndex+idx)].Term == args.Entries[idx].Term {
 		idx++
 	}
 	args.Entries = args.Entries[idx:]
-	/*
-		暂时
-		if len(args.Entries) > 0 {
-				FPrintf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
-			}
-	*/
+
+	//暂时
+	if len(args.Entries) > 0 {
+		DPrintf("####Server%d任期%d的日志变更前为%+v\n", rf.me, rf.currentTerm, rf.log)
+	}
+
 	// 注意Figure8, 这里只在leader有新的日志条目发送给follower时发生覆盖
 	if len(args.Entries) > 0 {
 		// 这里需要考虑RPC响应失败后, 收到相同RPC的情况, 不过这里是幂等的
@@ -430,7 +444,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// but different terms), delete the existing entry and all that
 		// follow it (§5.3)
 		//FPrintf("####Server%d任期%d的日志长度由%d变更为%d\n", rf.me, rf.currentTerm, preLogLen, len(rf.log))
-		rf.log = rf.log[:args.PrevLogIndex+idx]
+		rf.log = rf.log[:rf.vIndexToA(args.PrevLogIndex+idx)]
 		// 4. Append any new entries not already in the log
 		rf.log = append(rf.log, args.Entries...)
 		/*
@@ -438,13 +452,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		*/
 		rf.persist()
 	}
-	/*
-		暂时
-		if len(args.Entries) > 0 {
-				FPrintf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
-				FPrintf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
-			}
-	*/
+
+	//暂时
+	if len(args.Entries) > 0 {
+		DPrintf("####Server%d任期%d的日志变更后为%+v\n", rf.me, rf.currentTerm, rf.log)
+		DPrintf("####此时Leader%d任期%d\n", args.LeaderId, args.Term)
+	}
 
 	// 服务器只在日志和Leader匹配的情况下更新commitIndex
 	// rf.commitIndex可能变小, 然后导致越界错误
@@ -472,7 +485,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 	// Leader任期 < Follower任期
 	// 1. Reply false if term < currentTerm (§5.1)
-	if args.Term < rf.currentTerm || args.lastIncludedIndex <= rf.lastIncludedIndex {
+	if args.Term < rf.currentTerm || args.LastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
 	// 这里需要转换成Follower. 注意一个任期内只会有一个Leader
@@ -480,7 +493,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// set currentTerm = T, convert to follower (§5.1)
 	rf.convertToFollower(args.Term, args.LeaderId)
 
-	rf.extractSnapshot(args.data)
+	rf.extractSnapshot(args.Data)
 }
 
 //
@@ -556,6 +569,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.log = append(rf.log, Log{Command: command, Term: rf.currentTerm})
+
+	//暂时
+	DPrintf("####Leader%d任期%d的日志为%+v,命令为%v\n", rf.me, rf.currentTerm, rf.log, command)
+
 	index = rf.getLogLength()
 	term = rf.currentTerm
 	rf.matchIndex[rf.me] = rf.getLogLength()
@@ -600,6 +617,12 @@ func (rf *Raft) getLastLogTerm() int {
  * @Description: Leader给其他服务器发送心跳消息
  */
 func (rf *Raft) appendLog() {
+	/*
+		暂时
+		rf.mu.Lock()
+		FPrintf("####Leader%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
+		rf.mu.Unlock()
+	*/
 	for i := range rf.peers {
 		// 不用给自己发心跳
 		if i == rf.me {
@@ -619,25 +642,45 @@ func (rf *Raft) appendLog() {
 				snapshot := rf.persister.ReadSnapshot()
 				args := &InstallSnapshotArgs{Term: rf.currentTerm,
 					LeaderId:          rf.me,
-					lastIncludedIndex: rf.lastIncludedIndex,
-					lastIncludedTerm:  rf.lastIncludedTerm,
-					data:              snapshot}
+					LastIncludedIndex: rf.lastIncludedIndex,
+					LastIncludedTerm:  rf.lastIncludedTerm,
+					Data:              snapshot}
 				rf.mu.Unlock()
 				reply := &InstallSnapshotReply{}
 				// 这里失败了不需要重发
-				rf.sendInstallSnapshot(server, args, reply)
+				ok := rf.sendInstallSnapshot(server, args, reply)
+				if !ok {
+					return
+				}
+
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					FPrintf("####此时Leader%d任期%d变更为Follower任期%d\n", rf.me, rf.currentTerm, reply.Term)
+					rf.convertToFollower(reply.Term, -1)
+					rf.mu.Unlock()
+					return
+				}
+				// 这里再次获取锁以后, 可能已经不是leader了
+				if rf.role != Leader {
+					rf.mu.Unlock()
+					return
+				}
+
+				rf.matchIndex[server] = args.LastIncludedIndex
+				rf.nextIndex[server] = rf.matchIndex[server] + 1
+				rf.mu.Unlock()
 				return
 			} else if prevLogIndex == rf.lastIncludedIndex {
 				prevLogTerm = rf.lastIncludedTerm
 			} else if prevLogIndex >= 1 {
-				prevLogTerm = rf.log[prevLogIndex-1].Term
+				prevLogTerm = rf.log[rf.vIndexToA(prevLogIndex)-1].Term
 			}
 
 			// If last log index ≥ nextIndex for a follower: send
 			// AppendEntries RPC with log entries starting at nextIndex
 			entries := make([]Log, rf.getLogLength()-rf.nextIndex[server]+1)
 			for j := range entries {
-				entries[j] = rf.log[rf.nextIndex[server]-1+j]
+				entries[j] = rf.log[rf.vIndexToA(rf.nextIndex[server]-1+j)]
 			}
 
 			args := &AppendEntriesArgs{Term: rf.currentTerm,
@@ -684,7 +727,7 @@ func (rf *Raft) appendLog() {
 			} else if reply.LogLength < args.PrevLogIndex {
 				// follower的prevLogIndex位置没有日志, 直接从follower的日志下一个位置开始复制
 				rf.nextIndex[server] = reply.LogLength + 1
-			} else if lastIndex := rf.lastIndex(0, args.PrevLogIndex-1, reply.ConflictTerm); lastIndex != 0 {
+			} else if lastIndex := rf.lastIndex(0, rf.vIndexToA(args.PrevLogIndex)-1, reply.ConflictTerm); lastIndex != 0 {
 				/*
 					如果leader.log找到了Term为conflictTerm的日志，则下一次从leader.log中conflictTerm的
 					最后一个日志的下一个位置开始同步日志
@@ -760,16 +803,16 @@ func (rf *Raft) updateLeaderCommitIndex() {
 	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 	// set commitIndex = N (§5.3, §5.4).
 	maxCommitIdx := rf.getLogLength()
-	for maxCommitIdx > 0 {
+	// rf.lastIncludedIndex处的日志一定已经被提交了
+	for maxCommitIdx > rf.lastIncludedIndex {
 		replicaCnt := 0
 		for _, v := range rf.matchIndex {
 			if v >= maxCommitIdx {
 				replicaCnt++
 			}
 		}
-
 		// 只有当前任期的log用统计是否过半来决定是否commit, 之前任期的log被动commit
-		if replicaCnt > len(rf.peers)/2 && rf.log[maxCommitIdx-1].Term == rf.currentTerm &&
+		if replicaCnt > len(rf.peers)/2 && rf.log[rf.vIndexToA(maxCommitIdx)-1].Term == rf.currentTerm &&
 			maxCommitIdx > rf.commitIndex {
 			FPrintf("####Leader%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, maxCommitIdx)
 			rf.commitIndex = maxCommitIdx
@@ -991,22 +1034,35 @@ func (rf *Raft) applyCommittedEntries() {
 				rf.mu.Unlock()
 				break
 			}
-			/*
-				FPrintf("####Server%d任期%d日志长度%dcommitIndex%dlastApplied%d\n", rf.me, rf.currentTerm,
-					len(rf.log), rf.commitIndex, rf.lastApplied)
-			*/
-			// If commitIndex > lastApplied: increment lastApplied, apply
-			// log[lastApplied] to state machine (§5.3)
-			applyMsg := ApplyMsg{CommandValid: true,
-				Command:      rf.log[rf.lastApplied].Command,
-				CommandIndex: rf.lastApplied + 1,
-				Term:         rf.log[rf.lastApplied].Term}
-			rf.mu.Unlock()
-			rf.applyCh <- applyMsg
-			rf.mu.Lock()
-			//FPrintf("####Server%d任期%d提交了新的日志%+v\n", rf.me, rf.currentTerm, applyMsg)
-			rf.lastApplied++
-			rf.mu.Unlock()
+
+			if rf.lastApplied < rf.lastIncludedIndex {
+				applyMsg := ApplyMsg{CommandValid: false,
+					Command:      rf.persister.ReadSnapshot(),
+					CommandIndex: rf.lastIncludedIndex,
+					Term:         rf.lastIncludedTerm}
+				rf.mu.Unlock()
+				rf.applyCh <- applyMsg
+				rf.mu.Lock()
+				rf.lastApplied = rf.lastIncludedIndex
+				rf.mu.Unlock()
+			} else {
+				/*
+					FPrintf("####Server%d任期%d日志长度%dcommitIndex%dlastApplied%d\n", rf.me, rf.currentTerm,
+						len(rf.log), rf.commitIndex, rf.lastApplied)
+				*/
+				// If commitIndex > lastApplied: increment lastApplied, apply
+				// log[lastApplied] to state machine (§5.3)
+				applyMsg := ApplyMsg{CommandValid: true,
+					Command:      rf.log[rf.vIndexToA(rf.lastApplied)].Command,
+					CommandIndex: rf.lastApplied + 1,
+					Term:         rf.log[rf.vIndexToA(rf.lastApplied)].Term}
+				rf.mu.Unlock()
+				rf.applyCh <- applyMsg
+				rf.mu.Lock()
+				//FPrintf("####Server%d任期%d提交了新的日志%+v\n", rf.me, rf.currentTerm, applyMsg)
+				rf.lastApplied++
+				rf.mu.Unlock()
+			}
 		}
 	}
 }
@@ -1026,10 +1082,8 @@ func (rf *Raft) Snapshot(snapshot []byte) {
 //
 // extractSnapshot
 //  @Description: 提取快照中的元数据, 调用时必须持有锁
-// 这里的返回值暂时没用到
 //  @receiver rf
 //  @param snapshot 快照
-//  @return bool
 //
 func (rf *Raft) extractSnapshot(snapshot []byte) {
 	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
@@ -1038,15 +1092,26 @@ func (rf *Raft) extractSnapshot(snapshot []byte) {
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	var lastIncludedIndex, lastIncludedTerm int
+	// 注意这里解码的顺序必须和snapshot()里编码的顺序一致, 并且只有先解码前面的字段才能解码后面的字段
 	if d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
-		DPrintf("####decode error\n")
+		fmt.Printf("####decode error\n")
 		return
 	}
+
+	/*
+		fmt.Printf("####rf.lastIncludedIndex%d#len(rf.log)%d#lastIncludedIndex%d\n", rf.lastIncludedIndex,
+			len(rf.log), lastIncludedIndex)
+		删除
+	*/
+	// 裁剪日志, 注意裁剪可能发生多次, 所以不能简单地设置成rf.lastIncludedIndex:
+	if rf.lastIncludedIndex+len(rf.log) < lastIncludedIndex {
+		rf.log = nil
+	} else {
+		rf.log = rf.log[lastIncludedIndex-rf.lastIncludedIndex:]
+	}
+
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
-
-	// 裁剪日志, 注意裁剪可能发生多次, 所以不能简单地设置成rf.lastIncludedIndex:
-	rf.log = rf.log[rf.getLogLength()-rf.lastIncludedIndex:]
 	rf.persistAndSnapshot(snapshot)
 }
 

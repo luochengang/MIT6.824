@@ -138,25 +138,21 @@ func (kv *KVServer) snapshot() []byte {
 	defer kv.mu.Unlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	err := e.Encode(kv.maxraftstate)
+	err := e.Encode(kv.lastIncludedIndex)
 	if err != nil {
-		DPrintf("####Service%d快照时编码失败\n", kv.me)
-	}
-	err = e.Encode(kv.db)
-	if err != nil {
-		DPrintf("####Service%d快照时编码失败\n", kv.me)
-	}
-	err = e.Encode(kv.maxSequenceNum)
-	if err != nil {
-		DPrintf("####Service%d快照时编码失败\n", kv.me)
-	}
-	err = e.Encode(kv.lastIncludedIndex)
-	if err != nil {
-		DPrintf("####Service%d快照时编码失败\n", kv.me)
+		fmt.Printf("####Service%d快照时编码失败\n", kv.me)
 	}
 	err = e.Encode(kv.lastIncludedTerm)
 	if err != nil {
-		DPrintf("####Service%d快照时编码失败\n", kv.me)
+		fmt.Printf("####Service%d快照时编码失败\n", kv.me)
+	}
+	err = e.Encode(kv.db)
+	if err != nil {
+		fmt.Printf("####Service%d快照时编码失败\n", kv.me)
+	}
+	err = e.Encode(kv.maxSequenceNum)
+	if err != nil {
+		fmt.Printf("####Service%d快照时编码失败\n", kv.me)
 	}
 	data := w.Bytes()
 	return data
@@ -177,14 +173,13 @@ func (kv *KVServer) installSnapshot(data []byte) {
 	defer kv.mu.Unlock()
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var maxraftstate, lastIncludedIndex, lastIncludedTerm int
+	var lastIncludedIndex, lastIncludedTerm int
 	var db map[string]string
 	var maxSequenceNum map[int]int
-	if d.Decode(&maxraftstate) != nil || d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil ||
+	if d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&db) != nil || d.Decode(&maxSequenceNum) != nil {
 		DPrintf("####decode error\n")
 	} else {
-		kv.maxraftstate = maxraftstate
 		kv.lastIncludedIndex = lastIncludedIndex
 		kv.lastIncludedTerm = lastIncludedTerm
 		kv.db = db
