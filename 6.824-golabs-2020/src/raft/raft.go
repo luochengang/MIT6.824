@@ -472,12 +472,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 	// Leader任期 < Follower任期
 	// 1. Reply false if term < currentTerm (§5.1)
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm || args.lastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
-
-	// 这里需要转换成Follower吗
-	// TODO
+	// 这里需要转换成Follower. 注意一个任期内只会有一个Leader
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	rf.convertToFollower(args.Term, args.LeaderId)
 
 	rf.extractSnapshot(args.data)
 }
@@ -1019,37 +1020,34 @@ func (rf *Raft) applyCommittedEntries() {
 func (rf *Raft) Snapshot(snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	ok := rf.extractSnapshot(snapshot)
-	if !ok {
-		return
-	}
-
-	// 裁剪日志
-	rf.log = rf.log[rf.lastIncludedIndex:]
-	rf.persistAndSnapshot(snapshot)
+	rf.extractSnapshot(snapshot)
 }
 
 //
 // extractSnapshot
 //  @Description: 提取快照中的元数据, 调用时必须持有锁
+// 这里的返回值暂时没用到
 //  @receiver rf
 //  @param snapshot 快照
 //  @return bool
 //
-func (rf *Raft) extractSnapshot(snapshot []byte) bool {
+func (rf *Raft) extractSnapshot(snapshot []byte) {
 	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
-		return false
+		return
 	}
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	var lastIncludedIndex, lastIncludedTerm int
 	if d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
 		DPrintf("####decode error\n")
-		return false
+		return
 	}
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
-	return true
+
+	// 裁剪日志, 注意裁剪可能发生多次, 所以不能简单地设置成rf.lastIncludedIndex:
+	rf.log = rf.log[rf.getLogLength()-rf.lastIncludedIndex:]
+	rf.persistAndSnapshot(snapshot)
 }
 
 /**
