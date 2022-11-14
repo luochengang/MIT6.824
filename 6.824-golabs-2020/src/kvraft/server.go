@@ -261,6 +261,7 @@ func (kv *KVServer) executeCommand() {
 		*/
 		if kv.maxraftstate != -1 && kv.rf.RaftStateSize() > kv.maxraftstate {
 			snapshot := kv.snapshot()
+			// kv server需要把快照传给raft，是因为k/v服务器通过底层的Raft来存储快照
 			kv.rf.Snapshot(snapshot)
 		}
 	}
@@ -321,7 +322,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
+	/*
+		在这里新建了一个ApplyMsg通道, 然后把它作为参数传给了raft. 通道是引用类型,
+		所以kv.applyCh和rf.applyCh引用的是同一个通道
+	*/
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 

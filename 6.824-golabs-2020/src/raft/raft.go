@@ -1176,6 +1176,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.resetTimeout()
 	rf.cond = sync.NewCond(&rf.mu)
+	// 注意这里没有新建ApplyMsg通道, 取的是参数值
 	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
