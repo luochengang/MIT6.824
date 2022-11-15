@@ -18,6 +18,11 @@ type ShardMaster struct {
 
 type Op struct {
 	// Your data here.
+	Key         string
+	Value       string
+	OpType      string // "Put", "Append" or "Get"
+	ClientId    int    // client invoking request (6.3)
+	SequenceNum int    // to eliminate duplicates ($6.4)
 }
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
@@ -30,6 +35,15 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	preShards := sm.configs[len(sm.configs)-1].Shards
+	var shards [NShards]int
+	for i := 0; i < NShards; i++ {
+		shards[i] = preShards[i]
+	}
+	shards[args.Shard] = args.GID
+	config := Config{Num: len(sm.configs)}
 }
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
