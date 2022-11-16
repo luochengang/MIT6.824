@@ -19,7 +19,7 @@ package raft
 
 import (
 	"bytes"
-	"fmt"
+	log2 "log"
 	"math/rand"
 	"sync"
 	"time"
@@ -166,25 +166,25 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	err := e.Encode(rf.currentTerm)
 	if err != nil {
-		fmt.Printf("####Server%d编码任期%d失败\n", rf.me, rf.currentTerm)
+		log2.Fatalf("####Server%d编码任期%d失败\n", rf.me, rf.currentTerm)
 	}
 	err = e.Encode(rf.votedFor)
 	if err != nil {
-		fmt.Printf("####Server%d编码投票%d失败\n", rf.me, rf.votedFor)
+		log2.Fatalf("####Server%d编码投票%d失败\n", rf.me, rf.votedFor)
 	}
 	err = e.Encode(rf.log)
 	if err != nil {
-		fmt.Printf("####Server%d编码日志%+v失败\n", rf.me, rf.log)
+		log2.Fatalf("####Server%d编码日志%+v失败\n", rf.me, rf.log)
 	}
 
 	// 持久化快照相关的成员
 	err = e.Encode(rf.lastIncludedIndex)
 	if err != nil {
-		DPrintf("####Server%d编码lastIncludedIndex%d失败\n", rf.me, rf.lastIncludedIndex)
+		log2.Fatalf("####Server%d编码lastIncludedIndex%d失败\n", rf.me, rf.lastIncludedIndex)
 	}
 	err = e.Encode(rf.lastIncludedTerm)
 	if err != nil {
-		DPrintf("####Server%d编码lastIncludedTerm%d失败\n", rf.me, rf.lastIncludedTerm)
+		log2.Fatalf("####Server%d编码lastIncludedTerm%d失败\n", rf.me, rf.lastIncludedTerm)
 	}
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
@@ -201,25 +201,25 @@ func (rf *Raft) persistAndSnapshot(snapshot []byte) {
 	e := labgob.NewEncoder(w)
 	err := e.Encode(rf.currentTerm)
 	if err != nil {
-		fmt.Printf("####Server%d编码任期%d失败\n", rf.me, rf.currentTerm)
+		log2.Fatalf("####Server%d编码任期%d失败\n", rf.me, rf.currentTerm)
 	}
 	err = e.Encode(rf.votedFor)
 	if err != nil {
-		fmt.Printf("####Server%d编码投票%d失败\n", rf.me, rf.votedFor)
+		log2.Fatalf("####Server%d编码投票%d失败\n", rf.me, rf.votedFor)
 	}
 	err = e.Encode(rf.log)
 	if err != nil {
-		fmt.Printf("####Server%d编码日志%+v失败\n", rf.me, rf.log)
+		log2.Fatalf("####Server%d编码日志%+v失败\n", rf.me, rf.log)
 	}
 
 	// 持久化快照相关的成员
 	err = e.Encode(rf.lastIncludedIndex)
 	if err != nil {
-		DPrintf("####Server%d编码lastIncludedIndex%d失败\n", rf.me, rf.lastIncludedIndex)
+		log2.Fatalf("####Server%d编码lastIncludedIndex%d失败\n", rf.me, rf.lastIncludedIndex)
 	}
 	err = e.Encode(rf.lastIncludedTerm)
 	if err != nil {
-		DPrintf("####Server%d编码lastIncludedTerm%d失败\n", rf.me, rf.lastIncludedTerm)
+		log2.Fatalf("####Server%d编码lastIncludedTerm%d失败\n", rf.me, rf.lastIncludedTerm)
 	}
 	data := w.Bytes()
 	rf.persister.SaveStateAndSnapshot(data, snapshot)
@@ -255,7 +255,7 @@ func (rf *Raft) readPersist(data []byte) {
 	var lastIncludedIndex, lastIncludedTerm int
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil ||
 		d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
-		fmt.Println("####decode error")
+		log2.Fatalf("####decode error")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
@@ -1094,7 +1094,7 @@ func (rf *Raft) extractSnapshot(snapshot []byte) {
 	var lastIncludedIndex, lastIncludedTerm int
 	// 注意这里解码的顺序必须和snapshot()里编码的顺序一致, 并且只有先解码前面的字段才能解码后面的字段
 	if d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
-		fmt.Printf("####decode error\n")
+		log2.Fatalf("####decode error\n")
 		return
 	}
 

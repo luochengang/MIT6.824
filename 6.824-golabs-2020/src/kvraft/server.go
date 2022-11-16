@@ -5,7 +5,6 @@ import (
 	"../labrpc"
 	"../raft"
 	"bytes"
-	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -140,19 +139,19 @@ func (kv *KVServer) snapshot() []byte {
 	e := labgob.NewEncoder(w)
 	err := e.Encode(kv.lastIncludedIndex)
 	if err != nil {
-		fmt.Printf("####Service%d快照时编码失败\n", kv.me)
+		log.Fatalf("####Service%d快照时编码失败\n", kv.me)
 	}
 	err = e.Encode(kv.lastIncludedTerm)
 	if err != nil {
-		fmt.Printf("####Service%d快照时编码失败\n", kv.me)
+		log.Fatalf("####Service%d快照时编码失败\n", kv.me)
 	}
 	err = e.Encode(kv.db)
 	if err != nil {
-		fmt.Printf("####Service%d快照时编码失败\n", kv.me)
+		log.Fatalf("####Service%d快照时编码失败\n", kv.me)
 	}
 	err = e.Encode(kv.maxSequenceNum)
 	if err != nil {
-		fmt.Printf("####Service%d快照时编码失败\n", kv.me)
+		log.Fatalf("####Service%d快照时编码失败\n", kv.me)
 	}
 	data := w.Bytes()
 	return data
@@ -178,7 +177,7 @@ func (kv *KVServer) installSnapshot(data []byte) {
 	var maxSequenceNum map[int]int
 	if d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&db) != nil || d.Decode(&maxSequenceNum) != nil {
-		DPrintf("####decode error\n")
+		log.Fatalf("####decode error\n")
 	} else {
 		kv.lastIncludedIndex = lastIncludedIndex
 		kv.lastIncludedTerm = lastIncludedTerm
