@@ -28,14 +28,29 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (c *Config) Copy() Config {
+	config := Config{Num: c.Num, Shards: c.Shards, Groups: make(map[int][]string)}
+	for k := range c.Groups {
+		config.Groups[k] = append([]string{}, c.Groups[k]...)
+	}
+	return config
+}
+
 const (
-	OK = "OK"
+	OK             = "OK"
+	ErrWrongLeader = "ErrWrongLeader"
 )
 
 type Err string
 
+type CommonArgs struct {
+	ClientId    int // client invoking request
+	SequenceNum int // to eliminate duplicates
+}
+
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+	CommonArgs
 }
 
 type JoinReply struct {
@@ -45,6 +60,7 @@ type JoinReply struct {
 
 type LeaveArgs struct {
 	GIDs []int
+	CommonArgs
 }
 
 type LeaveReply struct {
@@ -55,6 +71,7 @@ type LeaveReply struct {
 type MoveArgs struct {
 	Shard int
 	GID   int
+	CommonArgs
 }
 
 type MoveReply struct {
@@ -64,6 +81,7 @@ type MoveReply struct {
 
 type QueryArgs struct {
 	Num int // desired config number
+	CommonArgs
 }
 
 type QueryReply struct {
