@@ -2,6 +2,7 @@ package shardmaster
 
 import (
 	"../raft"
+	"log"
 	"time"
 )
 import "../labrpc"
@@ -31,6 +32,15 @@ type Op struct {
 type void struct{}
 
 var member void
+
+const Debug = 1
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 func (sm *ShardMaster) start(comand Op) (isLeader bool) {
 	index, _, isLeader := sm.rf.Start(comand)
@@ -132,7 +142,47 @@ func (sm *ShardMaster) Raft() *raft.Raft {
 //  @param servers new GID -> servers mappings
 //
 func (sm *ShardMaster) join(args JoinArgs) {
+	config := sm.configs[len(sm.configs)-1].Copy()
+	DPrintf("####join前args.Servers%+v\n", args.Servers)
+	DPrintf("####join前config.Num%d#config.Shards%+v\n", config.Num, config.Shards)
+	config.Num = len(sm.configs)
+	// add "gid -> servers[]" key value pairs
+	for k, v := range args.Servers {
+		config.Groups[k] = append([]string{}, v...)
+	}
+	// 新增的gid -> 当前负载Shard数量
+	addGIDsToLoad := make(map[int]int)
+	for k := range args.Servers {
+		addGIDsToLoad[k] = 0
+	}
 
+	// 每个gid的平均负载
+	avg := NShards / len(config.Groups)
+	// gid -> 当前负载Shard数量
+	gidToLoad := make(map[int]int)
+	for i := 0; i < NShards; i++ {
+		gidToLoad[config.Shards[i]]++
+	}
+	for i := 0; i < NShards; i++ {
+		if len(addGIDsToLoad) == 0 {
+			break
+		}
+		if gidToLoad[config.Shards[i]] <= avg {
+			continue
+		}
+		for k := range addGIDsToLoad {
+			gidToLoad[config.Shards[i]]--
+			config.Shards[i] = k
+			addGIDsToLoad[k]++
+			if addGIDsToLoad[k] >= avg {
+				delete(addGIDsToLoad, k)
+			}
+			break
+		}
+	}
+
+	DPrintf("####join后config.Num%d#config.Shards%+v\n", config.Num, config.Shards)
+	sm.configs = append(sm.configs, config)
 }
 
 //  @Description: 调用时必须持有锁
@@ -140,27 +190,64 @@ func (sm *ShardMaster) join(args JoinArgs) {
 //  @param args
 //
 func (sm *ShardMaster) leave(args LeaveArgs) {
-	// TODO
 	config := sm.configs[len(sm.configs)-1].Copy()
+	DPrintf("####leave前args.GIDs%+v\n", args.GIDs)
+	DPrintf("####leave前config.Num%d#config.Shards%+v\n", config.Num, config.Shards)
 	config.Num = len(sm.configs)
+	// delete "gid -> servers[]" key value pairs
 	for _, v := range args.GIDs {
 		delete(config.Groups, v)
 	}
-
+	// 需要删除的gid集合
 	deletedGIDs := make(map[int]void)
 	for _, v := range args.GIDs {
 		deletedGIDs[v] = member
 	}
 
+	// 每个gid的平均负载
 	avg := NShards / len(config.Groups)
+	// 需要被重新分配的Shard
 	unallocShard := make(map[int]void)
+	// gid -> 当前负载Shard数量
+	gidToLoad := make(map[int]int)
 	for i := 0; i < NShards; i++ {
 		if _, ok := deletedGIDs[config.Shards[i]]; ok {
 			unallocShard[i] = member
+		} else {
+			gidToLoad[config.Shards[i]]++
+			if gidToLoad[config.Shards[i]] >= avg {
+				// 删除当前负载>=avg的gid key
+				delete(gidToLoad, config.Shards[i])
+			}
 		}
-
 	}
 
+	for k, _ := range unallocShard {
+		for gid, _ := range gidToLoad {
+			config.Shards[k] = gid
+			delete(unallocShard, k)
+			gidToLoad[gid]++
+			if gidToLoad[gid] > avg {
+				// 删除当前负载>=avg的gid key
+				delete(gidToLoad, gid)
+			}
+			break
+		}
+	}
+
+	// 每个gid都达到平均负载后, 可能仍旧有Shard未被分配, 但是只需要遍历一次config.Groups就可以全部分配
+	for gid, _ := range config.Groups {
+		if len(unallocShard) == 0 {
+			break
+		}
+		for k, _ := range unallocShard {
+			config.Shards[k] = gid
+			delete(unallocShard, k)
+			break
+		}
+	}
+
+	DPrintf("####leave前config.Num%d#config.Shards%+v\n", config.Num, config.Shards)
 	sm.configs = append(sm.configs, config)
 }
 
@@ -192,12 +279,14 @@ func (sm *ShardMaster) query(args QueryArgs) (config Config) {
 }
 
 func (sm *ShardMaster) executeCommand() {
+	DPrintf("####Server%d进入executeCommand\n", sm.me)
 	/*
 		applyCh是tester或service期望Raft发送ApplyMsg消息的通道
 		当每个Raftpeer意识到日志条目被提交时，peer应该通过传递给Make()的applyCh向同一服务器上的service（或tester）发送ApplyMsg
 		applyCh中的附加日志已经处于committed状态, 需要在server中执行该附加日志中的指令
 	*/
 	for applyMsg := range sm.applyCh {
+		DPrintf("####有applyMsg\n")
 		// 如果是快照
 		if !applyMsg.CommandValid {
 			continue
@@ -216,6 +305,7 @@ func (sm *ShardMaster) executeCommand() {
 			if sm.maxSequenceNum[op.ClientId] >= op.SequenceNum {
 				break
 			}
+			DPrintf("####调用join\n")
 			sm.join(op.Args.(JoinArgs))
 			sm.maxSequenceNum[op.ClientId] = op.SequenceNum
 		case "Leave":
