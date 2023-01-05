@@ -75,10 +75,12 @@ func (sm *ShardMaster) start(comand Op) (isLeader bool) {
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
+	DPrintf("####Join\n")
 	op := Op{Args: *args, OpType: "Join", ClientId: args.ClientId, SequenceNum: args.SequenceNum}
 	isLeader := sm.start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		reply.WrongLeader = true
 		return
 	}
 	reply.Err = OK
@@ -90,6 +92,7 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	isLeader := sm.start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		reply.WrongLeader = true
 		return
 	}
 	reply.Err = OK
@@ -101,6 +104,7 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	isLeader := sm.start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		reply.WrongLeader = true
 		return
 	}
 	reply.Err = OK
@@ -112,6 +116,7 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	isLeader := sm.start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		reply.WrongLeader = true
 		return
 	}
 	reply.Err = OK
@@ -273,8 +278,10 @@ func (sm *ShardMaster) query(args QueryArgs) (config Config) {
 		the latest configuration.
 	*/
 	if args.Num < 0 || args.Num >= len(sm.configs) {
+		DPrintf("####query返回args.Num%d#config%+v\n", args.Num, sm.configs[len(sm.configs)-1])
 		return sm.configs[len(sm.configs)-1].Copy()
 	}
+	DPrintf("####query返回args.Num%d#config%+v\n", args.Num, sm.configs[args.Num])
 	return sm.configs[args.Num].Copy()
 }
 
@@ -372,6 +379,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
 
 	// Your code here.
+	sm.configs[0].Num = 0
 	go sm.executeCommand()
 
 	return sm
