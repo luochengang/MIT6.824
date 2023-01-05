@@ -75,7 +75,6 @@ func (sm *ShardMaster) start(comand Op) (isLeader bool) {
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
-	DPrintf("####Join\n")
 	op := Op{Args: *args, OpType: "Join", ClientId: args.ClientId, SequenceNum: args.SequenceNum}
 	isLeader := sm.start(op)
 	if !isLeader {
@@ -172,7 +171,7 @@ func (sm *ShardMaster) join(args JoinArgs) {
 		if len(addGIDsToLoad) == 0 {
 			break
 		}
-		if gidToLoad[config.Shards[i]] <= avg {
+		if config.Shards[i] != 0 && gidToLoad[config.Shards[i]] <= avg {
 			continue
 		}
 		for k := range addGIDsToLoad {
@@ -207,6 +206,15 @@ func (sm *ShardMaster) leave(args LeaveArgs) {
 	deletedGIDs := make(map[int]void)
 	for _, v := range args.GIDs {
 		deletedGIDs[v] = member
+	}
+
+	// 如果Replica Group变为空, 将Shard都分配给gid0
+	if len(config.Groups) == 0 {
+		for i := range config.Shards {
+			config.Shards[i] = 0
+		}
+		sm.configs = append(sm.configs, config)
+		return
 	}
 
 	// 每个gid的平均负载
@@ -293,7 +301,6 @@ func (sm *ShardMaster) executeCommand() {
 		applyCh中的附加日志已经处于committed状态, 需要在server中执行该附加日志中的指令
 	*/
 	for applyMsg := range sm.applyCh {
-		DPrintf("####有applyMsg\n")
 		// 如果是快照
 		if !applyMsg.CommandValid {
 			continue
@@ -312,7 +319,6 @@ func (sm *ShardMaster) executeCommand() {
 			if sm.maxSequenceNum[op.ClientId] >= op.SequenceNum {
 				break
 			}
-			DPrintf("####调用join\n")
 			sm.join(op.Args.(JoinArgs))
 			sm.maxSequenceNum[op.ClientId] = op.SequenceNum
 		case "Leave":
@@ -373,6 +379,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm.configs = make([]Config, 1)
 	sm.configs[0].Groups = map[int][]string{}
 
+	// 注意这里调用了labgob.Register来注册Op结构体, 任何出现在Command中的结构体都需要调用labgob.Register注册
 	labgob.Register(Op{})
 	// 在这里新建了一个ApplyMsg通道, 然后把它作为参数传给了raft
 	sm.applyCh = make(chan raft.ApplyMsg)
@@ -380,6 +387,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 	// Your code here.
 	sm.configs[0].Num = 0
+	sm.maxSequenceNum = make(map[int]int)
 	go sm.executeCommand()
 
 	return sm

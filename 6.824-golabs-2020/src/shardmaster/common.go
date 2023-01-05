@@ -1,5 +1,7 @@
 package shardmaster
 
+import "../labgob"
+
 //
 // Master shard server: assigns shards to replication groups.
 //
@@ -88,4 +90,22 @@ type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+/*
+init()函数会在包被初始化后自动执行，并且在main()函数之前执行，但是需要注意的是init()以及main()函数都是无法被显式调用的.
+init()不是最先执行的, 在它之前会进行全局变量的初始化.
+*/
+func init() {
+	/*
+		call labgob.Register on structures you want Go's RPC library to marshall/unmarshall.
+		注意这里调用了labgob.Register来注册Op结构体, 任何出现在Command中的结构体都需要调用labgob.Register注册
+		如果这里不调用labgob.Register注册结构体, 那么Raft.persist()会报错编码日志失败, 如下:
+		[{Command:<nil> Term:1} {Command:{Args:{Num:-1 CommonArgs:{ClientId:2718134643594539720 SequenceNum:1}}
+		OpType:Query ClientId:2718134643594539720 SequenceNum:1} Term:1}]
+	*/
+	labgob.Register(QueryArgs{})
+	labgob.Register(JoinArgs{})
+	labgob.Register(LeaveArgs{})
+	labgob.Register(MoveArgs{})
 }
