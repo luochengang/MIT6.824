@@ -147,8 +147,8 @@ func (sm *ShardMaster) Raft() *raft.Raft {
 //
 func (sm *ShardMaster) join(args JoinArgs) {
 	config := sm.configs[len(sm.configs)-1].Copy()
-	DPrintf("####join前args.Servers%+v\n", args.Servers)
-	DPrintf("####join前config.Num%d#config.Shards%+v\n", config.Num, config.Shards)
+	DPrintf("####Server%djoin前args.Servers%+v\n", sm.me, args.Servers)
+	DPrintf("####Server%djoin前config.Num%d#config.Shards%+v\n", sm.me, config.Num, config.Shards)
 	config.Num = len(sm.configs)
 	// add "gid -> servers[]" key value pairs
 	for k, v := range args.Servers {
@@ -162,6 +162,9 @@ func (sm *ShardMaster) join(args JoinArgs) {
 
 	// 每个gid的平均负载
 	avg := NShards / len(config.Groups)
+	// 最终配置里, 有plusOneCnt个gid的负载为avg+1, 其它gid的负载都为avg
+	plusOneCnt := NShards % len(config.Groups)
+	plusOneGID := make(map[int]void)
 	// gid -> 当前负载Shard数量
 	gidToLoad := make(map[int]int)
 	for i := 0; i < NShards; i++ {
@@ -174,18 +177,29 @@ func (sm *ShardMaster) join(args JoinArgs) {
 		if config.Shards[i] != 0 && gidToLoad[config.Shards[i]] <= avg {
 			continue
 		}
+		if config.Shards[i] != 0 && gidToLoad[config.Shards[i]] == avg+1 && len(plusOneGID) <= plusOneCnt {
+			plusOneGID[config.Shards[i]] = member
+			if len(plusOneGID) <= plusOneCnt {
+				continue
+			} else {
+				delete(plusOneGID, config.Shards[i])
+			}
+		}
 		for k := range addGIDsToLoad {
 			gidToLoad[config.Shards[i]]--
 			config.Shards[i] = k
 			addGIDsToLoad[k]++
-			if addGIDsToLoad[k] >= avg {
+			if addGIDsToLoad[k] == avg {
 				delete(addGIDsToLoad, k)
+			} else if addGIDsToLoad[k] == avg+1 && len(plusOneGID) < plusOneCnt {
+				delete(addGIDsToLoad, k)
+				plusOneGID[k] = member
 			}
 			break
 		}
 	}
 
-	DPrintf("####join后config.Num%d#config.Shards%+v\n", config.Num, config.Shards)
+	DPrintf("####Server%djoin后config.Num%d#config.Shards%+v\n", sm.me, config.Num, config.Shards)
 	sm.configs = append(sm.configs, config)
 }
 
@@ -195,8 +209,8 @@ func (sm *ShardMaster) join(args JoinArgs) {
 //
 func (sm *ShardMaster) leave(args LeaveArgs) {
 	config := sm.configs[len(sm.configs)-1].Copy()
-	DPrintf("####leave前args.GIDs%+v\n", args.GIDs)
-	DPrintf("####leave前config.Num%d#config.Shards%+v\n", config.Num, config.Shards)
+	DPrintf("####Server%dleave前args.GIDs%+v\n", sm.me, args.GIDs)
+	DPrintf("####Server%dleave前config.Num%d#config.Shards%+v\n", sm.me, config.Num, config.Shards)
 	config.Num = len(sm.configs)
 	// delete "gid -> servers[]" key value pairs
 	for _, v := range args.GIDs {
@@ -219,6 +233,9 @@ func (sm *ShardMaster) leave(args LeaveArgs) {
 
 	// 每个gid的平均负载
 	avg := NShards / len(config.Groups)
+	// 最终配置里, 有plusOneCnt个gid的负载为avg+1, 其它gid的负载都为avg
+	plusOneCnt := NShards % len(config.Groups)
+	plusOneGID := make(map[int]void)
 	// 需要被重新分配的Shard
 	unallocShard := make(map[int]void)
 	// gid -> 当前负载Shard数量
@@ -231,12 +248,15 @@ func (sm *ShardMaster) leave(args LeaveArgs) {
 		}
 	}
 	for i := 0; i < NShards; i++ {
-		if gidToLoad[config.Shards[i]] >= avg {
+		if gidToLoad[config.Shards[i]] == avg {
 			/*
 				删除当前负载>=avg的gid key
 				这里要先遍历完一遍config.Shards, 再删除负载已经满足需求的
 			*/
 			delete(gidToLoad, config.Shards[i])
+		} else if gidToLoad[config.Shards[i]] == avg+1 {
+			// TODO
+			// 访问gidToLoad[config.Shards[i]] == 1是否有问题 v, ok := gidToLoad[config.Shards[i]]
 		}
 	}
 
@@ -265,7 +285,7 @@ func (sm *ShardMaster) leave(args LeaveArgs) {
 		}
 	}
 
-	DPrintf("####leave后config.Num%d#config.Shards%+v\n", config.Num, config.Shards)
+	DPrintf("####Server%dleave后config.Num%d#config.Shards%+v\n", sm.me, config.Num, config.Shards)
 	sm.configs = append(sm.configs, config)
 }
 
@@ -291,15 +311,12 @@ func (sm *ShardMaster) query(args QueryArgs) (config Config) {
 		the latest configuration.
 	*/
 	if args.Num < 0 || args.Num >= len(sm.configs) {
-		DPrintf("####query返回args.Num%d#config%+v\n", args.Num, sm.configs[len(sm.configs)-1])
 		return sm.configs[len(sm.configs)-1].Copy()
 	}
-	DPrintf("####query返回args.Num%d#config%+v\n", args.Num, sm.configs[args.Num])
 	return sm.configs[args.Num].Copy()
 }
 
 func (sm *ShardMaster) executeCommand() {
-	DPrintf("####Server%d进入executeCommand\n", sm.me)
 	/*
 		applyCh是tester或service期望Raft发送ApplyMsg消息的通道
 		当每个Raftpeer意识到日志条目被提交时，peer应该通过传递给Make()的applyCh向同一服务器上的service（或tester）发送ApplyMsg
