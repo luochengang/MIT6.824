@@ -228,10 +228,15 @@ func (sm *ShardMaster) leave(args LeaveArgs) {
 			unallocShard[i] = member
 		} else {
 			gidToLoad[config.Shards[i]]++
-			if gidToLoad[config.Shards[i]] >= avg {
-				// 删除当前负载>=avg的gid key
-				delete(gidToLoad, config.Shards[i])
-			}
+		}
+	}
+	for i := 0; i < NShards; i++ {
+		if gidToLoad[config.Shards[i]] >= avg {
+			/*
+				删除当前负载>=avg的gid key
+				这里要先遍历完一遍config.Shards, 再删除负载已经满足需求的
+			*/
+			delete(gidToLoad, config.Shards[i])
 		}
 	}
 
@@ -260,7 +265,7 @@ func (sm *ShardMaster) leave(args LeaveArgs) {
 		}
 	}
 
-	DPrintf("####leave前config.Num%d#config.Shards%+v\n", config.Num, config.Shards)
+	DPrintf("####leave后config.Num%d#config.Shards%+v\n", config.Num, config.Shards)
 	sm.configs = append(sm.configs, config)
 }
 
