@@ -33,7 +33,7 @@ type void struct{}
 
 var member void
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -154,53 +154,100 @@ func (sm *ShardMaster) join(args JoinArgs) {
 	for k, v := range args.Servers {
 		config.Groups[k] = append([]string{}, v...)
 	}
-	// 新增的gid -> 当前负载Shard数量
-	addGIDsToLoad := make(map[int]int)
-	for k := range args.Servers {
-		addGIDsToLoad[k] = 0
+
+	config = sm.adjustConfig(config)
+	DPrintf("####Server%djoin后config.Num%d#config.Shards%+v\n", sm.me, config.Num, config.Shards)
+	sm.configs = append(sm.configs, config)
+}
+
+//  @Description: 调整配置
+//  @receiver sm
+//  @param config 未经调整的配置
+//  @return Config 调整后的配置
+//
+func (sm *ShardMaster) adjustConfig(config Config) Config {
+	// 如果Replica Group变为空, 将Shard都分配给gid0
+	if len(config.Groups) == 0 {
+		for i := range config.Shards {
+			config.Shards[i] = 0
+		}
+		return config
 	}
 
 	// 每个gid的平均负载
 	avg := NShards / len(config.Groups)
+	// 需要被重新分配的Shard
+	unallocShard := make(map[int]void)
 	// 最终配置里, 有plusOneCnt个gid的负载为avg+1, 其它gid的负载都为avg
 	plusOneCnt := NShards % len(config.Groups)
+	// 负载为avg+1的gid Set
 	plusOneGID := make(map[int]void)
+	// 当前负载Shard数量低于avg的gid -> 负载
+	gidToUnderLoad := make(map[int]int)
 	// gid -> 当前负载Shard数量
 	gidToLoad := make(map[int]int)
-	for i := 0; i < NShards; i++ {
-		gidToLoad[config.Shards[i]]++
+
+	// 初始化gidToLoad
+	for gid, _ := range config.Groups {
+		gidToLoad[gid] = 0
 	}
 	for i := 0; i < NShards; i++ {
-		if len(addGIDsToLoad) == 0 {
-			break
-		}
-		if config.Shards[i] != 0 && gidToLoad[config.Shards[i]] <= avg {
-			continue
-		}
-		if config.Shards[i] != 0 && gidToLoad[config.Shards[i]] == avg+1 && len(plusOneGID) <= plusOneCnt {
-			plusOneGID[config.Shards[i]] = member
-			if len(plusOneGID) <= plusOneCnt {
-				continue
+		_, ok := gidToLoad[config.Shards[i]]
+		if config.Shards[i] == 0 || !ok || gidToLoad[config.Shards[i]] == avg+1 {
+			unallocShard[i] = member
+		} else if gidToLoad[config.Shards[i]] == avg {
+			_, ok := plusOneGID[config.Shards[i]]
+			if !ok && len(plusOneGID) < plusOneCnt {
+				plusOneGID[config.Shards[i]] = member
+				gidToLoad[config.Shards[i]]++
 			} else {
-				delete(plusOneGID, config.Shards[i])
+				unallocShard[i] = member
 			}
-		}
-		for k := range addGIDsToLoad {
-			gidToLoad[config.Shards[i]]--
-			config.Shards[i] = k
-			addGIDsToLoad[k]++
-			if addGIDsToLoad[k] == avg {
-				delete(addGIDsToLoad, k)
-			} else if addGIDsToLoad[k] == avg+1 && len(plusOneGID) < plusOneCnt {
-				delete(addGIDsToLoad, k)
-				plusOneGID[k] = member
-			}
-			break
+		} else {
+			gidToLoad[config.Shards[i]]++
 		}
 	}
 
-	DPrintf("####Server%djoin后config.Num%d#config.Shards%+v\n", sm.me, config.Num, config.Shards)
-	sm.configs = append(sm.configs, config)
+	// 初始化gidToUnderLoad
+	for gid, load := range gidToLoad {
+		if load < avg {
+			gidToUnderLoad[gid] = load
+		}
+	}
+
+	for gid, _ := range gidToUnderLoad {
+		for shard, _ := range unallocShard {
+			config.Shards[shard] = gid
+			gidToLoad[gid]++
+			gidToUnderLoad[gid]++
+			delete(unallocShard, shard)
+			if gidToUnderLoad[gid] == avg {
+				delete(gidToUnderLoad, gid)
+				break
+			}
+		}
+	}
+
+	// 如果仍旧有需要被重新分配的Shard, 那么分配给负载为avg的gid
+	if len(unallocShard) != 0 {
+		// 负载为avg的gid Set
+		loadAvgGID := make(map[int]void)
+		for gid, load := range gidToLoad {
+			if load == avg {
+				loadAvgGID[gid] = member
+			}
+		}
+
+		for shard, _ := range unallocShard {
+			for gid, _ := range loadAvgGID {
+				config.Shards[shard] = gid
+				delete(loadAvgGID, gid)
+				delete(unallocShard, shard)
+			}
+		}
+	}
+
+	return config
 }
 
 //  @Description: 调用时必须持有锁
@@ -216,75 +263,8 @@ func (sm *ShardMaster) leave(args LeaveArgs) {
 	for _, v := range args.GIDs {
 		delete(config.Groups, v)
 	}
-	// 需要删除的gid集合
-	deletedGIDs := make(map[int]void)
-	for _, v := range args.GIDs {
-		deletedGIDs[v] = member
-	}
 
-	// 如果Replica Group变为空, 将Shard都分配给gid0
-	if len(config.Groups) == 0 {
-		for i := range config.Shards {
-			config.Shards[i] = 0
-		}
-		sm.configs = append(sm.configs, config)
-		return
-	}
-
-	// 每个gid的平均负载
-	avg := NShards / len(config.Groups)
-	// 最终配置里, 有plusOneCnt个gid的负载为avg+1, 其它gid的负载都为avg
-	plusOneCnt := NShards % len(config.Groups)
-	plusOneGID := make(map[int]void)
-	// 需要被重新分配的Shard
-	unallocShard := make(map[int]void)
-	// gid -> 当前负载Shard数量
-	gidToLoad := make(map[int]int)
-	for i := 0; i < NShards; i++ {
-		if _, ok := deletedGIDs[config.Shards[i]]; ok {
-			unallocShard[i] = member
-		} else {
-			gidToLoad[config.Shards[i]]++
-		}
-	}
-	for i := 0; i < NShards; i++ {
-		if gidToLoad[config.Shards[i]] == avg {
-			/*
-				删除当前负载>=avg的gid key
-				这里要先遍历完一遍config.Shards, 再删除负载已经满足需求的
-			*/
-			delete(gidToLoad, config.Shards[i])
-		} else if gidToLoad[config.Shards[i]] == avg+1 {
-			// TODO
-			// 访问gidToLoad[config.Shards[i]] == 1是否有问题 v, ok := gidToLoad[config.Shards[i]]
-		}
-	}
-
-	for k, _ := range unallocShard {
-		for gid, _ := range gidToLoad {
-			config.Shards[k] = gid
-			delete(unallocShard, k)
-			gidToLoad[gid]++
-			if gidToLoad[gid] > avg {
-				// 删除当前负载>=avg的gid key
-				delete(gidToLoad, gid)
-			}
-			break
-		}
-	}
-
-	// 每个gid都达到平均负载后, 可能仍旧有Shard未被分配, 但是只需要遍历一次config.Groups就可以全部分配
-	for gid, _ := range config.Groups {
-		if len(unallocShard) == 0 {
-			break
-		}
-		for k, _ := range unallocShard {
-			config.Shards[k] = gid
-			delete(unallocShard, k)
-			break
-		}
-	}
-
+	config = sm.adjustConfig(config)
 	DPrintf("####Server%dleave后config.Num%d#config.Shards%+v\n", sm.me, config.Num, config.Shards)
 	sm.configs = append(sm.configs, config)
 }
