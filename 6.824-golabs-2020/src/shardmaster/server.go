@@ -155,23 +155,30 @@ func (sm *ShardMaster) join(args JoinArgs) {
 		config.Groups[k] = append([]string{}, v...)
 	}
 
-	config = sm.adjustConfig(config)
+	/*
+		注意原来的config.Groups就可能因为Move操作而负载不均衡, 所以不属于args.Servers的gid也要重新负载均衡
+		负载不均衡既可能由Join和Leave操作导致, 也可能由Move操作导致
+	*/
+	sm.adjustConfig(&config)
 	DPrintf("####Server%djoin后config.Num%d#config.Shards%+v\n", sm.me, config.Num, config.Shards)
 	sm.configs = append(sm.configs, config)
 }
 
 //  @Description: 调整配置
+//  时间复杂度为O(NShards)的负载均衡算法
 //  @receiver sm
 //  @param config 未经调整的配置
 //  @return Config 调整后的配置
 //
-func (sm *ShardMaster) adjustConfig(config Config) Config {
+func (sm *ShardMaster) adjustConfig(config *Config) {
 	// 如果Replica Group变为空, 将Shard都分配给gid0
 	if len(config.Groups) == 0 {
-		for i := range config.Shards {
-			config.Shards[i] = 0
-		}
-		return config
+		config.Shards = [NShards]int{}
+		return
+	} else if len(config.Groups) >= NShards {
+		// 此时每个gid最多负载一个Shard
+		sm.oneShardPerGID(config)
+		return
 	}
 
 	// 每个gid的平均负载
@@ -193,7 +200,7 @@ func (sm *ShardMaster) adjustConfig(config Config) Config {
 	}
 	for i := 0; i < NShards; i++ {
 		_, ok := gidToLoad[config.Shards[i]]
-		if config.Shards[i] == 0 || !ok || gidToLoad[config.Shards[i]] == avg+1 {
+		if !ok || gidToLoad[config.Shards[i]] == avg+1 {
 			unallocShard[i] = member
 		} else if gidToLoad[config.Shards[i]] == avg {
 			_, ok := plusOneGID[config.Shards[i]]
@@ -246,8 +253,41 @@ func (sm *ShardMaster) adjustConfig(config Config) Config {
 			}
 		}
 	}
+}
 
-	return config
+//  @Description: 每个gid最多负载一个Shard的负载均衡算法
+//  @receiver sm
+//  @param config
+//
+func (sm *ShardMaster) oneShardPerGID(config *Config) {
+	// 需要被重新分配的Shard
+	unallocShard := make(map[int]void)
+	// 已经被分配一个Shard的gid
+	allocGID := make(map[int]void)
+	for i := 0; i < NShards; i++ {
+		if _, ok := config.Groups[config.Shards[i]]; !ok {
+			unallocShard[i] = member
+		} else if _, ok := allocGID[config.Shards[i]]; ok {
+			unallocShard[i] = member
+		} else {
+			allocGID[config.Shards[i]] = member
+		}
+	}
+
+	for gid, _ := range config.Groups {
+		if len(unallocShard) == 0 {
+			break
+		}
+		if _, ok := allocGID[gid]; ok {
+			continue
+		}
+		for shard, _ := range unallocShard {
+			config.Shards[shard] = gid
+			delete(unallocShard, shard)
+			allocGID[gid] = member
+			break
+		}
+	}
 }
 
 //  @Description: 调用时必须持有锁
@@ -264,7 +304,11 @@ func (sm *ShardMaster) leave(args LeaveArgs) {
 		delete(config.Groups, v)
 	}
 
-	config = sm.adjustConfig(config)
+	/*
+		注意原来的config.Groups就可能因为Move操作而负载不均衡, 所以不属于args.Servers的gid也要重新负载均衡
+		负载不均衡既可能由Join和Leave操作导致, 也可能由Move操作导致
+	*/
+	sm.adjustConfig(&config)
 	DPrintf("####Server%dleave后config.Num%d#config.Shards%+v\n", sm.me, config.Num, config.Shards)
 	sm.configs = append(sm.configs, config)
 }
