@@ -44,7 +44,7 @@ import "../labgob"
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
-	CommandIndex int
+	CommandIndex int // log entry index start at 1
 	Term         int
 }
 
@@ -91,8 +91,8 @@ type Raft struct {
 	   by leader (first index is 1)
 	*/
 	log []Log
-	// 用于日志压缩, 也需要持久化
-	lastIncludedIndex int // the snapshot replaces all entries up through and including this index
+	// 用于日志压缩, 也需要持久化. log entry index start at 1
+	lastIncludedIndex int // the snapshot replaces all entries up through and including this index.
 	lastIncludedTerm  int // term of lastIncludedIndex
 
 	// Volatile state on all servers
@@ -103,6 +103,7 @@ type Raft struct {
 	/*
 	   for each server, index of the next log entry to send to that server (initialized
 	   to leader last log index + 1)
+	   log entry index start at 1
 	*/
 	nextIndex  []int
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server, initialized to 0
@@ -397,12 +398,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		return
 	}
-	// If RPC request or response contains term T > currentTerm:
-	// set currentTerm = T, convert to follower (§5.1)
+	/*
+		If RPC request or response contains term T > currentTerm:
+		set currentTerm = T, convert to follower (§5.1)
+		当term T == currentTerm时，注意currentTerm已经有了一个Leader，所以currentTerm任期不会有第二个Leader，
+		并且Candidate要变成Follower
+	*/
 	rf.convertToFollower(args.Term, args.LeaderId)
 	//FPrintf("####Server%d任期%d的日志为%+v\n", rf.me, rf.currentTerm, rf.log)
 
 	if args.PrevLogIndex < rf.lastIncludedIndex {
+		// not matching
 		return
 	} else if args.PrevLogIndex == rf.lastIncludedIndex {
 		if args.PrevLogTerm != rf.lastIncludedTerm {
@@ -559,7 +565,6 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
 
 	// Your code here (2B).
 	rf.mu.Lock()
@@ -580,7 +585,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	rf.mu.Unlock()
 
-	rf.appendLog()
+	isLeader := true
 	return index, term, isLeader
 }
 
@@ -672,7 +677,8 @@ func (rf *Raft) appendLog() {
 				return
 			} else if prevLogIndex == rf.lastIncludedIndex {
 				prevLogTerm = rf.lastIncludedTerm
-			} else if prevLogIndex >= 1 {
+			} else {
+				// 这里一定满足 prevLogIndex >= 1
 				prevLogTerm = rf.log[rf.vIndexToA(prevLogIndex)-1].Term
 			}
 
@@ -804,16 +810,25 @@ func (rf *Raft) updateLeaderCommitIndex() {
 	// set commitIndex = N (§5.3, §5.4).
 	maxCommitIdx := rf.getLogLength()
 	// rf.lastIncludedIndex处的日志一定已经被提交了
-	for maxCommitIdx > rf.lastIncludedIndex {
+	for maxCommitIdx > rf.lastIncludedIndex && maxCommitIdx > rf.commitIndex {
+		// 统计rf.matchIndex[]中 >= maxCommitIdx 的元素个数
 		replicaCnt := 0
+		// 统计rf.matchIndex[]中 < maxCommitIdx 的元素个数
+		falseCnt := 0
 		for _, v := range rf.matchIndex {
 			if v >= maxCommitIdx {
 				replicaCnt++
+				continue
+			}
+
+			falseCnt++
+			// 如果rf.matchIndex[]中 < maxCommitIdx 的元素个数已经达到一半，那么已经不可能满足需求
+			if falseCnt >= (len(rf.peers)+1)/2 {
+				break
 			}
 		}
 		// 只有当前任期的log用统计是否过半来决定是否commit, 之前任期的log被动commit
-		if replicaCnt > len(rf.peers)/2 && rf.log[rf.vIndexToA(maxCommitIdx)-1].Term == rf.currentTerm &&
-			maxCommitIdx > rf.commitIndex {
+		if replicaCnt > len(rf.peers)/2 && rf.log[rf.vIndexToA(maxCommitIdx)-1].Term == rf.currentTerm {
 			FPrintf("####Leader%d任期%d的commitIndex变更为%d\n", rf.me, rf.currentTerm, maxCommitIdx)
 			rf.commitIndex = maxCommitIdx
 			rf.cond.Signal()
@@ -873,6 +888,7 @@ func (rf *Raft) lastIndex(left, right, term int) int {
  * @Description: 服务器选举超时, 开始选举
  */
 func (rf *Raft) startElection() {
+	// 注意这里要加锁，并且是等到rf.mu.Unlock()后，这里才能获得锁
 	rf.mu.Lock()
 	rf.currentTerm++
 	// 刚开始选举时的任期
@@ -898,16 +914,20 @@ func (rf *Raft) startElection() {
 	for i := range rf.peers {
 		// 如果已经有半数或者以上投了反对票, 那么已经不可能成为leader
 		if falseVote >= (len(rf.peers)+1)/2 {
-			break
+			return
 		}
 		// 不用给自己发
 		if i == rf.me {
 			continue
 		}
+
 		go func(server int) {
 			rf.mu.Lock()
-			// 如果这里已经不是Candidate了, 那么释放锁后直接返回, 因为只有Candidate才需要发送RequestVote RPC
-			if rf.role != Candidate {
+			/*
+				如果这里已经不是Candidate了, 或者currentTerm变了, 那么释放锁后直接返回, 因为只有Candidate才需要发送RequestVote RPC
+				如果已经有了过半投票，变成Leader了，没发完的RequestVote RPC就不需要再发了
+			*/
+			if rf.role != Candidate || rf.currentTerm != term {
 				rf.mu.Unlock()
 				return
 			}
@@ -928,8 +948,8 @@ func (rf *Raft) startElection() {
 			}
 
 			rf.mu.Lock()
-			// 如果这里已经不是Candidate了, 那么释放锁后直接返回, 因为只有Candidate才需要发送RequestVote RPC
-			if rf.role != Candidate {
+			// 如果这里已经不是Candidate了, 或者currentTerm变了, 那么释放锁后直接返回, 因为只有Candidate才需要发送RequestVote RPC
+			if rf.role != Candidate || rf.currentTerm != term {
 				rf.mu.Unlock()
 				return
 			}
