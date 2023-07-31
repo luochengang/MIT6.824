@@ -61,6 +61,16 @@ const (
 	Follower
 )
 
+/*
+broadcastTime << electionTimeout << MTBF
+In this inequality broadcastTime is the average time it takes a server to send RPCs in parallel to every server
+in the cluster and receive their responses;
+electionTimeout is the election timeout described in Section 5.2;
+MTBF is the average time between failures for a single server.
+The broadcast time should be an order of magnitude less than the election timeout so that leaders can reliably
+send the heartbeat messages required to keep followers from starting elections;
+given the randomized approach used for election timeouts, this inequality also makes split votes unlikely.
+*/
 // ms
 const (
 	CheckElectTimeout = 10
@@ -1002,6 +1012,7 @@ func (rf *Raft) checkElectLoop() {
 
 /**
  * @Description: 调用时必须持有锁
+ * given the randomized approach used for election timeouts, this inequality also makes split votes unlikely.
  */
 func (rf *Raft) resetTimeout() {
 	randTime := ElectTimeoutMin + rand.Intn(ElectTimeoutMax-ElectTimeoutMin)

@@ -20,9 +20,19 @@ https://cn.pingcap.com/blog/optimizing-raft-in-tikv
 
 ## 未完成
 
-d) membership change
-e) membership change为什么一次只变更一个成员
+1) membership change
+2) leader transfer
+
+https://github.com/baidu/braft/blob/master/docs/cn/raft_protocol.md
+
+https://github.com/baidu/braft
 
 ## 其它
 
+### 测试linux命令
+
 nohup go test > /root/script/out10 &
+
+### snapshot流动方向
+
+![](C:\Users\luoch\software\github\MIT6.824\snapshot流动方向.jpg)
