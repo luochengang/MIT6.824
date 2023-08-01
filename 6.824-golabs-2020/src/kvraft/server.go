@@ -20,13 +20,6 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-type Result int
-
-const (
-	Fail Result = iota
-	Success
-)
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
@@ -92,9 +85,25 @@ func (kv *KVServer) start(comand Op) (isLeader bool) {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	/*
-			Second, a leader must check whether it has been deposed before processing a read-only request (its
-			information may be stale if a more recent leader has been elected). Raft handles this by having the leader
-			exchange heartbeat messages with a majority of the cluster before responding to read-only requests.
+		kv.maxSequenceNum[args.ClientId] >= args.SequenceNum 说明command已经applied
+		已经applied的command不再走raft流程，不再保存到日志，直接返回结果
+		linearizable semantics: each operation appears to execute instantaneously, exactly once, at some point between its
+		invocation and its response
+		这里满足linearizable semantics
+	*/
+	kv.mu.Lock()
+	if kv.maxSequenceNum[args.ClientId] >= args.SequenceNum {
+		kv.mu.Unlock()
+		reply.Err = OK
+		reply.Value = kv.db[args.Key]
+		return
+	}
+	kv.mu.Unlock()
+
+	/*
+		Second, a leader must check whether it has been deposed before processing a read-only request (its
+		information may be stale if a more recent leader has been elected). Raft handles this by having the leader
+		exchange heartbeat messages with a majority of the cluster before responding to read-only requests.
 		这里的Get类型命令需要通道ExeResult是因为这里需要知道该命令是否已经被commit
 	*/
 	op := Op{Key: args.Key, OpType: "Get", ClientId: args.ClientId, SequenceNum: args.SequenceNum}
@@ -117,6 +126,24 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	/*
+		kv.maxSequenceNum会被持久化到snapshot里
+		kv.maxSequenceNum[args.ClientId] >= args.SequenceNum 说明command已经applied
+		已经applied的command不再走raft流程，不再保存到日志，直接返回结果
+		linearizable semantics: each operation appears to execute instantaneously, exactly once, at some point between its
+		invocation and its response.
+		这里满足linearizable semantics
+		If it receives a command whose serial number has already been executed, it responds immediately without
+		re-executing the request.
+	*/
+	kv.mu.Lock()
+	if kv.maxSequenceNum[args.ClientId] >= args.SequenceNum {
+		kv.mu.Unlock()
+		reply.Err = OK
+		return
+	}
+	kv.mu.Unlock()
+
 	op := Op{Key: args.Key, Value: args.Value, OpType: args.Op, ClientId: args.ClientId, SequenceNum: args.SequenceNum}
 	isLeader := kv.start(op)
 	if !isLeader {
@@ -133,6 +160,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 //  @return []byte 快照
 //
 func (kv *KVServer) snapshot() []byte {
+	/*
+		注意snapshot和install snapshot都是在kvserver层完成的，而不是raft层
+		raft层无法snapshot，因为raft层没有db信息
+		同理raft层无法install snapshot，因为raft层无法保存db信息
+	*/
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	w := new(bytes.Buffer)
@@ -189,7 +221,7 @@ func (kv *KVServer) installSnapshot(data []byte) {
 func (kv *KVServer) executeCommand() {
 	/*
 		applyCh是tester或service期望Raft发送ApplyMsg消息的通道
-		当每个Raftpeer意识到日志条目被提交时，peer应该通过传递给Make()的applyCh向同一服务器上的service（或tester）发送ApplyMsg
+		当每个Raft peer意识到日志条目被提交时，peer应该通过传递给Make()的applyCh向同一服务器上的service（或tester）发送ApplyMsg
 		applyCh中的附加日志已经处于committed状态, 需要在server中执行该附加日志中的指令
 	*/
 	for applyMsg := range kv.applyCh {
@@ -214,6 +246,10 @@ func (kv *KVServer) executeCommand() {
 				break
 			}
 			kv.db[op.Key] += op.Value
+			/*
+				注意这里，只有kv.applyCh channel内的command才会使kv.maxSequenceNum[op.ClientId]递增。
+				command只有被applied才会使kv.maxSequenceNum[op.ClientId]递增。
+			*/
 			kv.maxSequenceNum[op.ClientId] = op.SequenceNum
 		case "Put":
 			// 如果已经执行过, 那么不重复执行
@@ -242,9 +278,13 @@ func (kv *KVServer) executeCommand() {
 		val, ok := kv.indexToCh.Load(applyMsg.CommandIndex)
 		if !ok {
 			/*
-					如果index对应的通道不存在, 则新建通道
-					这里选择缓冲通道/无缓冲通道对读取没有差别, 但是对写有差别. 选择缓冲通道的好处是, 写完以后不用等读取就可以继续执行
-				    同一条命令可能会在日志里存储两次, 于是会有两个索引, 这两个索引对应的通道都需要发送消息
+				1、如果index对应的通道不存在, 则新建通道
+				这里选择缓冲通道/无缓冲通道对读取没有差别, 但是对写有差别. 选择缓冲通道的好处是, 写完以后不用等读取就可以继续执行
+				同一条命令可能会在日志里存储两次, 于是会有两个索引, 这两个索引对应的通道都需要发送消息
+				2、同一条命令可能会在log里存储两次
+				3、if the leader crashes after committing the log entry but before responding to the client, the client will
+				retry the command with a new leader, causing it to be executed a second time. The solution is for clients
+				to assign unique serial numbers to every command.
 			*/
 			kv.indexToCh.Store(applyMsg.CommandIndex, make(chan Op, 1))
 			val, _ = kv.indexToCh.Load(applyMsg.CommandIndex)
@@ -322,8 +362,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	/*
-		在这里新建了一个ApplyMsg通道, 然后把它作为参数传给了raft. 通道是引用类型,
-		所以kv.applyCh和rf.applyCh引用的是同一个通道
+			在这里新建了一个ApplyMsg通道, 然后把它作为参数传给了raft. 通道是引用类型,
+			所以kv.applyCh和rf.applyCh引用的是同一个通道
+		    注意这里的ApplyMsg通道是无缓冲通道
 	*/
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
